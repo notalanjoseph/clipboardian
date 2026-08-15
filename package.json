@@ -1,0 +1,29 @@
+{
+  "name": "clipboardian",
+  "version": "1.0.0",
+  "description": "Local clipboard text history with a global-hotkey search popup",
+  "license": "GPL-3.0-or-later",
+  "private": true,
+  "main": "build/main/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json && mkdir -p build/renderer && cp src/renderer/index.html src/renderer/styles.css src/renderer/tray-icon.png build/renderer/",
+    "postinstall": "electron-rebuild -f -w better-sqlite3",
+    "start": "pnpm run build && electron --no-sandbox ."
+  },
+  "dependencies": {
+    "electron": "^33.0.0",
+    "better-sqlite3": "^11.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "@types/node": "^22.0.0",
+    "@types/better-sqlite3": "^7.6.0",
+    "@electron/rebuild": "^3.7.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "electron",
+      "better-sqlite3"
+    ]
+  }
+}
