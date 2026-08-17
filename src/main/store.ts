@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3';
 import { app } from 'electron';
 import * as path from 'path';
+import * as fs from 'fs';
 
 export interface Entry {
   id: number;
@@ -12,10 +13,11 @@ export interface Entry {
 const MAX_UNPINNED_ENTRIES = 500;
 
 let db: Database.Database;
+let dbFile: string;
 
-export function init(): void {
-  const dbPath = path.join(app.getPath('userData'), 'clipboardian.db');
-  db = new Database(dbPath);
+export function init(overridePath?: string): void {
+  dbFile = overridePath ?? path.join(app.getPath('userData'), 'clipboardian.db');
+  db = new Database(dbFile);
   db.pragma('journal_mode = WAL');
   db.exec(`
     CREATE TABLE IF NOT EXISTS entries (
@@ -69,4 +71,24 @@ export function touch(id: number): void {
 
 export function getById(id: number): Entry | undefined {
   return db.prepare('SELECT * FROM entries WHERE id = ?').get(id) as Entry | undefined;
+}
+
+export function close(): void {
+  try {
+    db?.close();
+  } catch {
+    // best-effort
+  }
+}
+
+export function wipeData(): void {
+  close();
+  const base = dbFile;
+  for (const suffix of ['', '-wal', '-shm', '-journal']) {
+    try {
+      fs.unlinkSync(base + suffix);
+    } catch {
+      // ignore already-missing files
+    }
+  }
 }

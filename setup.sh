@@ -8,7 +8,9 @@
 # Hotkey: Super+V is used if it's free on this system, otherwise falls back
 # to Super+Shift+V (Super+V is a built-in GNOME shortcut on many Ubuntu
 # installs — toggles the notification/calendar panel — so it's often taken).
-# Pass an explicit binding as $1 to skip auto-detection entirely.
+# If both are already taken, the hotkey is left unbound rather than silently
+# assigning a binding something else already owns. Pass an explicit binding
+# as $1 to skip auto-detection entirely.
 set -euo pipefail
 
 BASE="org.gnome.settings-daemon.plugins.media-keys"
@@ -29,10 +31,36 @@ ELECTRON_BIN="${REPO_DIR}/node_modules/.bin/electron"
 find_binding_conflict() {
   python3 - "$1" "$2" <<'PY'
 import ast
+import re
 import subprocess
 import sys
 
 candidate, exclude_path = sys.argv[1], sys.argv[2]
+
+# GNOME/GTK accelerator strings aren't modifier-order-stable: the exact same
+# key combination can be stored as "<Super><Shift>v" or "<Shift><Super>v"
+# depending on how it was set (e.g. GNOME Settings' own UI writes modifiers
+# in GTK's canonical bit-order, Shift before Super, while this project's own
+# candidates historically used Super-first) — confirmed directly on a real
+# machine: a Quick Settings shortcut rebound to Super+Shift+V via GNOME
+# Settings was stored as "<Shift><Super>v", which a naive `val == candidate`
+# comparison against "<Super><Shift>v" never matches, silently missing a
+# real conflict. Normalize modifier order before comparing so this class of
+# false-negative can't happen again, regardless of which order either side
+# happens to use.
+_MODIFIER_ORDER = ['Shift', 'Control', 'Alt', 'Super', 'Hyper', 'Meta', 'Primary']
+
+
+def normalize_accel(accel):
+    if not isinstance(accel, str) or not accel:
+        return accel
+    mods = re.findall(r'<([^>]+)>', accel)
+    key = re.sub(r'(<[^>]+>)+', '', accel)
+    mods_sorted = sorted(
+        set(mods),
+        key=lambda m: _MODIFIER_ORDER.index(m) if m in _MODIFIER_ORDER else 999,
+    )
+    return ''.join(f'<{m}>' for m in mods_sorted) + key.lower()
 
 
 def sh(*args):
@@ -46,9 +74,12 @@ def matches(raw):
     except (ValueError, SyntaxError):
         return False
     if isinstance(val, str):
-        return val == candidate
+        return normalize_accel(val) == normalize_accel(candidate)
     if isinstance(val, (list, tuple)):
-        return candidate in val
+        return any(
+            isinstance(v, str) and normalize_accel(v) == normalize_accel(candidate)
+            for v in val
+        )
     return False
 
 
@@ -97,10 +128,17 @@ if [[ -n "${1:-}" ]]; then
 elif holder="$(find_binding_conflict '<Super>v' "$SLOT_PATH")"; then
   BINDING='<Super>v'
   echo "Super+V is free on this system — using it."
-else
+elif holder2="$(find_binding_conflict '<Super><Shift>v' "$SLOT_PATH")"; then
   BINDING='<Super><Shift>v'
   echo "Super+V is already bound to: $holder"
   echo "Using Super+Shift+V instead. Free up Super+V and rerun ./setup.sh to switch."
+else
+  BINDING=''
+  echo "Super+V is already bound to: $holder"
+  echo "Super+Shift+V is already bound to: $holder2"
+  echo "Could not find a free hotkey for Clipboardian — leaving it unbound."
+  echo "Please bind one manually via:"
+  echo "  GNOME Settings -> Keyboard -> Keyboard Shortcuts -> Custom Shortcuts -> 'Clipboardian'"
 fi
 
 echo "Installing dependencies..."
@@ -140,7 +178,12 @@ gsettings set "${BASE}.custom-keybinding:${SLOT_PATH}" name 'Clipboardian'
 gsettings set "${BASE}.custom-keybinding:${SLOT_PATH}" command "$CMD"
 gsettings set "${BASE}.custom-keybinding:${SLOT_PATH}" binding "$BINDING"
 
-echo "Hotkey bound to: $BINDING"
+if [[ -n "$BINDING" ]]; then
+  echo "Hotkey bound to: $BINDING"
+else
+  echo "Hotkey left unbound (see above) — set one manually via GNOME Settings, then"
+  echo "this slot ('Clipboardian') will already be there waiting for a binding."
+fi
 echo "Command: $CMD"
 echo "To rebind manually, use:"
 echo "  GNOME Settings -> Keyboard -> Keyboard Shortcuts -> Custom Shortcuts -> 'Clipboardian'"

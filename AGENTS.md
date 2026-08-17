@@ -32,10 +32,69 @@ absolute path resolved at setup time, and won't update themselves.
 pnpm install       # postinstall runs electron-rebuild for better-sqlite3's native binding
 pnpm run build     # tsc + copies static renderer assets (html/css/png) into build/
 pnpm start          # build + launch (electron --no-sandbox .)
+pnpm test           # build + node:test unit tests for store.ts (see below)
 ```
 
-No test suite exists (verified manually end-to-end during initial build — see
-"How it was verified" below). No linter/formatter configured.
+**`pnpm test` covers `store.ts` only** (`src/main/store.test.ts`) — dedup,
+prune-to-500, search ordering/filtering, `touch`, `getById`, `wipeData`'s
+on-disk cleanup. Everything else (Electron main-process wiring, the
+renderer, real GUI interaction) still has zero automated coverage and
+relies on the manual verification methodology documented in "How it was
+verified" below — `store.ts` was singled out specifically because it's pure
+logic with no Electron/GUI dependency, unlike the rest of this codebase.
+
+Uses Node's built-in `node:test` + `node:assert/strict` — no new
+dependency, consistent with this project's "don't add a framework/bundler
+until it's actually outgrown the plain approach" stance elsewhere. Tests
+run against `store.ts`'s **compiled JS output** in `build/`, not the `.ts`
+source directly.
+
+**Must run via `ELECTRON_RUN_AS_NODE=1 electron --test build`, not plain
+`node --test build`** — confirmed necessary by testing, not assumption.
+`better-sqlite3`'s native binding is compiled by `electron-rebuild`
+(this project's own `postinstall` script) against *Electron's* Node ABI,
+not the system Node's — the same ABI mismatch this project already
+documented under "How it was verified" for querying the DB directly. Using
+plain `node --test` hits `ERR_DLOPEN_FAILED`
+(`NODE_MODULE_VERSION` mismatch) immediately; `ELECTRON_RUN_AS_NODE=1
+electron` makes the Electron binary behave as a matching-ABI Node runtime,
+exactly like the existing DB-inspection technique. `package.json`'s `test`
+script already does this — don't invoke `node --test` directly.
+
+**`store.ts`'s `init()` takes an optional path override
+(`init(overridePath?: string)`)** specifically so tests can point it at a
+temp file instead of `app.getPath('userData')` — `app` isn't a real object
+outside a running Electron process (required under plain Node, the
+`electron` package is just a path string), so `store.test.ts` calls
+`store.init(tempFile)` to avoid ever touching `app.getPath` at all.
+`main.ts`'s own `store.init()` call (no args) is unaffected.
+
+**Test timestamps must not rely on `created_at`'s sub-millisecond
+ordering** — found via a real, reproducible test failure, not
+theorized. `store.ts`'s ordering/pruning queries only sort by `created_at`
+(millisecond resolution); a human can never act twice within 1ms, but a
+tight test loop calling `addEntry()`/`touch()` back-to-back easily can, and
+SQLite's tie-breaking among equal `created_at` values isn't insertion
+order. Confirmed directly: an early draft of the prune test (505
+back-to-back `addEntry()` calls, no delay) intermittently kept the
+*oldest* entry instead of pruning it, and the "search ordered by
+created_at desc"/"touch bumps to top" tests occasionally asserted the
+wrong order — all from real timestamp collisions, not flawed assertions.
+**Deliberately did not "fix" this by adding an `id`-based tiebreaker to
+`store.ts`'s queries** — that would be solving a problem no real user can
+ever trigger (matches this project's established stance on not adding
+handling for scenarios that can't happen, e.g. the CLIPBOARD-polling
+same-text-twice case elsewhere in this file). Fixed the *tests* instead:
+`waitForNextMs()` in `store.test.ts` synchronously busy-waits for
+`Date.now()` to tick over before any call whose relative ordering is
+asserted — deterministic regardless of system timer/scheduling
+granularity, unlike an async `setTimeout`-based sleep (which was tried
+first and is not guaranteed to exceed 1ms in practice). Verified by
+re-running the full suite repeatedly with no flakes, and by deliberately
+breaking an unrelated assertion to confirm the runner still fails loudly
+rather than silently passing.
+
+No linter/formatter configured.
 
 ## Architecture
 
@@ -45,11 +104,19 @@ src/main/clipboardWatcher.ts polls clipboard.readText() every 500ms, feeds new e
 src/main/store.ts            better-sqlite3: schema, insert/dedup/bump, prune, search
 src/main/popupWindow.ts       the hidden/shown BrowserWindow: create, show/hide/toggle, position
 src/main/ipcHandlers.ts       ipcMain handlers: search / selectEntry / hidePopup
+src/main/appImageSetup.ts     packaged-AppImage-only: registers hotkey + autostart on
+                              first launch, self-heals on move, respects user opt-outs
 src/preload/preload.ts        contextBridge exposing window.clipboardAPI to the renderer
 src/renderer/                 index.html + renderer.ts (vanilla, no framework) + styles.css
 setup.sh                      user-run: pnpm install + build, registers the GNOME
                               custom keybinding (append-only), writes autostart entry
+resources/icon.png            512x512 app icon, used by electron-builder for the AppImage
+                              (separate from src/renderer/tray-icon.png, the small tray icon)
 ```
+
+`pnpm run dist` packages the app into `dist/Clipboardian-<version>.AppImage` via
+`electron-builder` (config in `package.json`'s `"build"` field) — see the
+"Packaging" section below for the gotchas involved.
 
 No bundler, no UI framework — the renderer is one plain `<script>`-loaded TS
 file. Don't introduce webpack/vite/React/etc. unless the UI genuinely outgrows
@@ -144,6 +211,80 @@ Don't re-attempt these without re-reading why they were rejected:
   false-positive on unrelated bindings that happen to contain it (e.g. a
   hypothetical `<Super>vv`).
 
+  **Correction — the original fallback logic had a real gap: it never
+  checked whether `<Super><Shift>v` was ALSO taken before assigning it.**
+  If both were claimed by something else, `setup.sh`/`appImageSetup.ts`
+  would still happily `gsettings set ... binding '<Super><Shift>v'` — no
+  error, but the binding would silently never fire (GNOME's key-grabbing is
+  first-come-first-served; whatever registered it first keeps getting the
+  real key press), reproducing the exact same class of silent failure this
+  project already hit once for `<Super>v` vs. `toggle-message-tray`, just
+  for the fallback instead. Fixed by running `find_binding_conflict()` a
+  second time against `<Super><Shift>v` before assigning it; if that's
+  *also* taken, the binding is deliberately left unset (never written)
+  rather than assigning something unusable, with a log message (and, in
+  `appImageSetup.ts`, a `notifyNoFreeHotkey()` desktop notification) telling
+  the user to bind one manually. Verified directly by simulating both
+  conflicts at once (clearing nothing — `toggle-message-tray` claims
+  `<Super>v`, a temporary fake custom-keybinding slot claims
+  `<Super><Shift>v`) and confirming the slot's `binding` key stayed `''`.
+
+  **`appImageSetup.ts`'s retry-every-launch behavior for this case needed
+  one more check to avoid a self-inflicted bug**: since no marker gets
+  written when both are taken, every subsequent launch retries the
+  conflict check — but if the user acts on the notification and binds one
+  manually via GNOME Settings in the meantime, a naive retry would
+  overwrite their manual choice the next time `ensureHotkey()` runs. Fixed
+  by reading the slot's *current* `binding` value first; if it's already
+  non-empty (the user's own choice, or a still-taken value that somehow
+  became set), the code marks the slot as managed and leaves it alone
+  instead of re-deciding. Verified by simulating a manual bind
+  (`<Control><Alt>v`) after a "both taken" run, relaunching, and confirming
+  the log shows `hotkey already bound to <Control><Alt>v; leaving as-is`
+  rather than overwriting it — and that `currentBindingLabel()`'s
+  humanizer correctly renders arbitrary user-chosen modifiers too (not just
+  the two bindings this project assigns itself), confirmed via that same
+  custom binding showing up correctly as "Ctrl+Alt+V" in the next launch's
+  notification.
+
+  **Correction — `find_binding_conflict()`/`PY_FIND_CONFLICT`'s conflict
+  check itself had a gap: it compared accelerator strings with plain
+  `val == candidate`, but GNOME/GTK accelerator strings aren't
+  modifier-order-stable.** The same key combination can be stored as
+  `<Super><Shift>v` or `<Shift><Super>v` depending on how it was set — GNOME
+  Settings' own Custom Shortcuts UI writes modifiers in GTK's canonical
+  bit-order (Shift before Super), while this project's own candidate
+  strings use Super-first. Found via real-world use, not synthetically: a
+  user rebound GNOME's Quick Settings panel to Super+Shift+V, which GNOME
+  Settings stored as `gsettings get org.gnome.shell.keybindings
+  toggle-quick-settings` → `['<Shift><Super>v']`; `find_binding_conflict`'s
+  exact-string check against `<Super><Shift>v` never matched, so the
+  "both taken" logic above missed the conflict, assigned
+  `<Super><Shift>v` anyway, and — since GNOME's key-grabbing is
+  first-come-first-served and Quick Settings already owned the actual key
+  press — the hotkey silently never fired at all, while the app confidently
+  notified the user to press it. Fixed by normalizing both sides before
+  comparing: `normalize_accel()` extracts the `<Mod>` tags with regex,
+  dedupes, sorts them by a fixed canonical order
+  (`Shift, Control, Alt, Super, Hyper, Meta, Primary`), and re-joins with
+  the lowercased key — applied to both the candidate and every value read
+  from gsettings, for both plain strings and array membership. Ported to
+  both `setup.sh`'s `find_binding_conflict()` and `appImageSetup.ts`'s
+  `PY_FIND_CONFLICT` (kept in sync per this project's usual convention).
+  One packaging gotcha hit while porting: `PY_FIND_CONFLICT` is itself a JS
+  template literal (backtick-delimited) — an early draft of the explanatory
+  Python comment used backticks around `val == candidate`, which silently
+  terminated the JS string early and broke `tsc` with a `',' expected`
+  error nowhere near the real problem; fixed by just not using backticks
+  inside that comment. Verified by reproducing the user's exact machine
+  state (`toggle-message-tray = ['<Super>v', '<Super>m']`,
+  `toggle-quick-settings = ['<Shift><Super>v']`), clearing the
+  already-wrongly-set `<Super><Shift>v` binding and the `.hotkey-managed`
+  marker so the fixed logic would re-decide, relaunching the rebuilt
+  AppImage, and confirming the log now correctly reads `could not find a
+  free hotkey: Super+V and Super+Shift+V are both taken` with the binding
+  left `''` — instead of wrongly claiming `<Super><Shift>v`.
+
 - **Reaching the resident instance is `app.requestSingleInstanceLock()` +
   `second-instance`**, not a hand-rolled socket/D-Bus service. Every hotkey
   press launches a short-lived `electron ... --toggle-popup` process; the
@@ -152,6 +293,414 @@ Don't re-attempt these without re-reading why they were rejected:
   lock, fires `second-instance` in the resident process, and exits quickly
   (~0.3s measured). Don't build a custom IPC channel for this — Electron
   already provides it.
+
+## Packaging (AppImage via electron-builder)
+
+- **`electron` must be a `devDependency`, not a regular `dependency`.**
+  electron-builder refuses to build otherwise ("Package electron is only
+  allowed in devDependencies") — it treats `electron` as a build-time tool it
+  bundles itself, not a runtime dependency of your app code. Moved it during
+  this project; `better-sqlite3` stays a real `dependency` since it's an
+  actual native module the packaged app requires at runtime.
+
+- **`app.commandLine.appendSwitch('no-sandbox')` does NOT work for baking
+  `--no-sandbox` into a packaged build — confirmed by testing, not assumption.**
+  Added it as the first line of `main.ts` and it still hit the same FATAL
+  `chrome-sandbox` crash as running with no flag at all. The sandbox
+  decision happens natively, before any of the app's JS executes — by the
+  time our code runs, it's too late to influence it from within the same
+  process.
+
+  **Correction — `linux.executableArgs: ["--no-sandbox"]` was tried next and
+  looked confirmed working, but that was a false positive.** Every test of
+  it happened only via `--appimage-extract-and-run` in this sandboxed dev
+  environment (the only way to run an AppImage here at all, since it lacks
+  FUSE) — `ps` showing `--no-sandbox` in that mode was actually *not* coming
+  from `executableArgs`. Direct testing on a real machine (FUSE present,
+  genuine double-click/direct execution — see below) proved
+  `executableArgs` only gets baked into the **embedded `.desktop` file's
+  `Exec=` line** (`Exec=AppRun --no-sandbox %U`), which is *only* read when
+  a desktop-integration tool creates a menu entry from it — plain direct
+  execution or double-click invokes `AppRun` directly with zero args and
+  never touches that `.desktop` file at all.
+
+  **What's actually responsible for correct sandboxing on every launch path:
+  AppRun's own built-in adaptive check**, bundled generically by
+  electron-builder into every AppImage — before exec'ing the real binary it
+  runs `unshare -Ur true` as a heuristic (does this kernel/context support
+  unprivileged user namespaces?) and only adds `--no-sandbox` itself if that
+  heuristic fails, otherwise leaving the real Chromium sandbox enabled. This
+  is *why* every test in this dev sandbox (where the heuristic reliably
+  fails) showed `--no-sandbox` regardless of whether `executableArgs` was
+  set — and why a real end-user machine may run with the sandbox genuinely
+  enabled (no `--no-sandbox` anywhere in `ps`) without crashing, which was
+  observed directly: a real double-click launch on GNOME 46 ran with zero
+  `--no-sandbox` flags anywhere in the process tree and worked fine, while a
+  second launch moments later (different invocation context) had AppRun add
+  `--no-sandbox` on its own — the check is genuinely per-invocation, not a
+  fixed property of the machine. **Given this, `executableArgs` was removed
+  from `package.json` entirely** — it was inert for the launch paths that
+  matter and, for the one path where it *did* apply (a
+  Gear-Lever/AppImageLauncher-created menu entry), it would have forced
+  `--no-sandbox` unconditionally, defeating AppRun's better, adaptive
+  per-launch decision for no benefit. Don't re-add it without a concrete
+  reason tied to that specific desktop-integration path.
+
+- **`directories.buildResources` must be overridden away from electron-builder's
+  default (`build/`)** — this project already uses `build/` for `tsc`'s
+  compiled output, so left at the default it would collide with our own
+  build directory. Set to `resources/` instead, with the app icon at
+  `resources/icon.png` (512x512, separate from the small tray-icon.png the
+  running app itself uses for the tray).
+
+- **The custom `"files"` array (`["build/**/*", "package.json"]`) does NOT
+  break native module bundling.** It looked like it might exclude
+  `node_modules` (and thus `better-sqlite3`'s compiled binding) since the
+  glob doesn't mention it — but electron-builder separately auto-detects and
+  bundles production `dependencies` regardless of the `files` filter.
+  Confirmed by inspecting the packaged output:
+  `resources/app.asar.unpacked/node_modules/better-sqlite3/build/Release/better_sqlite3.node`
+  is present, and the packaged app successfully read/wrote the real SQLite
+  DB when tested.
+
+- **Testing the built AppImage in this sandboxed dev environment needs
+  `--appimage-extract-and-run`.** Running it directly fails with
+  `dlopen(): error loading libfuse.so.2` — FUSE isn't available here (common
+  in containers). Real end-user desktops typically have FUSE, so this is a
+  dev-environment-only workaround, not a fix shipped in the app itself. When
+  verifying future packaging changes here, use
+  `./dist/Clipboardian-*.AppImage --appimage-extract-and-run` instead of
+  wasting time trying to get FUSE working in this environment.
+
+- **The AppImage registers its own hotkey/autostart in-process
+  (`src/main/appImageSetup.ts`), gated entirely on `process.env.APPIMAGE`
+  being set** (confirmed present even under `--appimage-extract-and-run`, not
+  assumed) — so `pnpm start`/dev-mode `electron .` never has this var set and
+  is completely unaffected; that flow still relies on `setup.sh`. Called as
+  the *last* line inside `main.ts`'s `whenReady()`, after tray creation and
+  `popupWindow.createHidden()`, since every step is a blocking
+  `execFileSync` call and shouldn't delay the tray icon or the popup
+  appearing.
+
+  - **Three independently-stale gsettings values need independent
+    read-before-write checks, not one gate.** `custom-keybindings` array
+    membership and the slot's `name`/`command` are always safe to self-heal
+    (e.g. after the AppImage file is moved/renamed — verified by literally
+    moving the built AppImage and confirming `command` and the autostart
+    file's `Exec=` line both updated to the new path on the next launch).
+    `binding` is different: this code runs **automatically on every login
+    with no user action**, unlike `setup.sh` which only ever runs when a
+    user deliberately invokes it — so blindly re-deciding `binding` whenever
+    something else needed fixing would silently clobber a binding the user
+    changed via GNOME Settings' own Custom Shortcuts UI.
+
+  - **An empty `binding` value is ambiguous and a marker file is the only
+    fix.** GNOME's Custom Shortcuts UI clears a shortcut by setting
+    `binding` to `''`, not by deleting the custom-keybinding slot — so
+    "never assigned yet" and "user deliberately disabled it" are
+    indistinguishable from the gsettings value alone. First implementation
+    got this wrong (checked only whether `binding` currently reads empty,
+    ORed with "slot was just created") and a test simulating a user clearing
+    the binding after a successful run proved it: the next launch
+    silently reassigned it. Fixed with a `.hotkey-managed` marker file in
+    `app.getPath('userData')` — the binding is only ever decided when the
+    slot was just newly created *or* the marker doesn't exist yet (truly
+    first-ever), never merely because it currently reads empty. Verified by
+    the same test after the fix: binding stayed cleared. The autostart file
+    has the same shape of problem and the same fix — a `.autostart-managed`
+    marker distinguishes "never created" (create it) from "user deleted it
+    on purpose" (leave deleted), matching the README's documented "safe to
+    delete that file if you don't want autostart" promise.
+
+  - **Every gsettings-value comparison is routed through a shared `python3`
+    `ast.literal_eval` helper** (`PY_VALUE_MATCHES`), not just the
+    conflict-detection logic — never hand-parse or hand-construct GVariant
+    literal text in JS/TS. Scripts are invoked via
+    `execFileSync('python3', ['-', ...args], { input: script })`, which is
+    argv-identical to `setup.sh`'s `python3 - "$1" "$2" <<'PY'`, so
+    `find_binding_conflict()` and the array-append logic port over
+    verbatim with zero translation risk.
+
+  - Hotkey registration and autostart-file handling run in **two separate
+    try/catch blocks** — a failure in one (e.g. `gsettings`/`python3`
+    missing from `PATH`) doesn't skip the other, and doesn't crash the app;
+    confirmed by temporarily shadowing both binaries with always-failing
+    stand-ins on `PATH` and observing the app still started fully (tray,
+    popup, clipboard watcher) with the failure only visible in
+    `console.error` and a small `appimage-setup.log` file in
+    `app.getPath('userData')` — necessary because a packaged AppImage
+    launched via the GNOME keybinding or autostart has no visible terminal
+    for `console.error` to reach otherwise.
+
+  - **A native `Notification` fires when the hotkey binding is first
+    decided** (`notifyHotkeyBound()` in `appImageSetup.ts`) — the log file
+    is useless for telling an actual first-time user what shortcut they got
+    (especially the `<Super><Shift>v` fallback case, which they'd otherwise
+    have no way to discover). Only fires exactly once, in the same
+    `slotWasMissing || !everManaged` branch that decides the binding itself
+    — never on later self-heal runs. Guarded with `Notification.isSupported()`
+    and a try/catch, consistent with this file's best-effort error handling
+    elsewhere; confirmed the `org.freedesktop.Notifications` D-Bus service
+    is genuinely present and responds on the target desktop (`gdbus call
+    ... GetCapabilities`), not just that the call didn't throw.
+
+  - **Double-clicking the AppImage a second time also notifies, in both
+    directions** (`notifyAlreadyRunning()`/`notifyRelaunched()`) — a plain
+    double-click (no `--toggle-popup`) with a resident instance already
+    running previously did nothing visible at all (the losing process just
+    quits; the resident's `second-instance` handler only acted on the
+    hotkey's own toggle arg). Now the resident's `second-instance` handler
+    has an `else` branch for exactly this case. Symmetrically, a plain
+    double-click that *revives* a quit app doesn't show the popup either
+    (only the hotkey arg does that) — `notifyRelaunched()` covers that case
+    from `whenReady()`'s own `else` branch. Both read the hotkey's *current*
+    live value via a new `currentBindingLabel()` (not just the two values
+    this project assigns — also handles a binding the user rebound manually
+    via GNOME Settings), and both are gated on `process.env.APPIMAGE` like
+    `ensureHotkeyAndAutostart`, so dev-mode `pnpm start` stays exactly as
+    quiet as before.
+
+    **Avoiding a double-notification on a genuine first-ever launch took an
+    explicit guard, not just careful ordering.** `alreadyConfigured =
+    appImageSetup.isHotkeyConfigured()` is captured at the very top of
+    `whenReady()`, *before* `ensureHotkeyAndAutostart()` runs — reusing the
+    existing `.hotkey-managed` marker file check. Without it, a true first
+    launch would fire both `notifyRelaunched()` (from the `else` branch,
+    since `--toggle-popup` isn't in argv) *and* `notifyHotkeyBound()` (from
+    `ensureHotkeyAndAutostart()` moments later) back to back. Verified
+    directly via a temporary debug counter on `showNotification()`: exactly
+    one call on a genuine cold start, exactly one call each on a
+    steady-state relaunch and an already-running double-click.
+
+- **Correction — "double-clicking does nothing" was misdiagnosed as a
+  missing-mimetype-handler problem; it was actually just missing FUSE.**
+  First diagnosis: `xdg-mime query default application/vnd.appimage`
+  returned empty and `gio open <file>` (what Nautilus does internally on
+  double-click) launched nothing, concluded from that alone that Nautilus
+  has no AppImage handler and would need a separate tool
+  (AppImageLauncher/Gear Lever). That test ran on a machine that *also*
+  lacked FUSE at the time — two confounded variables, one wrong conclusion.
+  After `libfuse2` was installed, real double-click on the same GNOME
+  46/Nautilus desktop **worked immediately, with no AppImage integration
+  tool installed at all**. Lesson: isolate variables before attributing a
+  failure — the `gio open` "launches nothing" result was actually the
+  `libfuse.so.2` crash happening invisibly, not evidence of a missing
+  handler. Gear Lever/AppImageLauncher may still be worth having for proper
+  app-menu integration, but they are **not required** just to make
+  double-click launch the app, contrary to what was first documented here
+  and in the README.
+
+- **Tray "Uninstall..." (`appImageSetup.uninstall()`) is deliberately NOT
+  gated on `process.env.APPIMAGE`**, unlike `ensureHotkeyAndAutostart()`.
+  `setup.sh` (dev mode) and the AppImage's own first-run setup both write
+  into the exact same gsettings slot name/path, so one cleanup function
+  correctly reverses either — gating it to AppImage-only would leave
+  dev-mode users with no way to clean up via the tray at all.
+
+  **Real race condition found and fixed during testing, not assumed away:**
+  the popup window's renderer calls `search` once on its own initial page
+  load, regardless of visibility (it's pre-warmed hidden, per
+  `popupWindow.ts`). Wiring the "also delete clipboard history" checkbox as
+  `appImageSetup.uninstall()` → `store.wipeData()` → `app.quit()` hit this
+  directly: `store.wipeData()` closes the DB, and if that renderer's
+  initial `search` IPC call hadn't resolved yet, `ipcHandlers.ts`'s
+  `search` handler threw `TypeError: The database connection is not open`
+  — reproduced directly via a temporary CLI test hook, not theorized. Fix:
+  call `popupWindow.destroy()` **before** `store.wipeData()`, not after —
+  killing the renderer first structurally eliminates the race (no live IPC
+  sender left), rather than adding defensive null-checks in `store.ts`'s
+  query functions to paper over it.
+
+  **The "Quit" menu item got the same checkbox and the same fix** — a user
+  may want to wipe history without also tearing down the hotkey/autostart
+  (that distinction is the whole point of having two separate menu items).
+  Its handler mirrors `Uninstall...`'s exactly (`clipboardWatcher.stop()` →
+  `popupWindow.destroy()` → `store.wipeData()` if checked → `app.quit()`)
+  minus the `appImageSetup.uninstall()` call — re-verified via the same
+  temporary-test-hook approach that the DB actually gets wiped, no race
+  error appears, and critically that the gsettings hotkey registration is
+  left completely untouched (Quit must never call `uninstall()`).
+
+  **`store.wipeData()` closes the DB before deleting its files, not
+  after** — it's opened in WAL mode (`store.ts`'s `init()`), so unlinking
+  `clipboardian.db` out from under a still-open connection risks
+  corruption/lock errors; `close()` (a thin `db.close()` wrapper) is called
+  first.
+
+  **The confirmation dialog must use the async `dialog.showMessageBox`,
+  not `showMessageBoxSync`** — only the async form's resolved result
+  includes `checkboxChecked`; the sync form only returns the button index.
+
+- **The registered hotkey command points at a self-regenerating wrapper
+  script (`toggle-wrapper.sh` in `app.getPath('userData')`), not the
+  `.AppImage` file directly** — added after the user noticed the AppImage
+  build's hotkey popup was ~1.5-2s slower than the source/`setup.sh` build's
+  (<1s). Root cause: every hotkey press re-triggers the *entire* AppImage
+  bootstrap (FUSE-mount the squashfs, run `AppRun`'s bash script — env var
+  exports plus its `unshare -Ur true` sandbox heuristic — then finally exec
+  the real `clipboardian` binary) even when a resident instance is already
+  running and the press is just going to lose
+  `app.requestSingleInstanceLock()` and exit. Confirmed via web research
+  this is a known, unavoidable-at-the-AppImage-level limitation — AppImage's
+  own maintainers explicitly rejected generic "reuse an existing mount"
+  schemes as fragile
+  ([AppImage/type2-runtime discussion #1327](https://github.com/orgs/AppImage/discussions/1327)),
+  and their stated preferred pattern is exactly what this project already
+  does: "keep the main application running as a parent process... rather
+  than launching independent AppImage instances." A related
+  electron-builder issue confirmed the specific mechanism works
+  ([electron-builder #1727](https://github.com/electron-userland/electron-builder/issues/1727)):
+  executing the Electron binary directly from inside the already-mounted
+  `/tmp/.mount_XXXX/` directory is fast and skips the slow outer bootstrap
+  entirely.
+
+  `ensureFastToggleWrapper()` in `appImageSetup.ts` exploits this
+  automatically: since AppImage's mount lifecycle is refcounted to
+  processes from that mount, `process.execPath` inside the running resident
+  (e.g. `/tmp/.mount_XXXX/clipboardian`) is a live, already-mounted binary
+  the whole time the resident is alive — confirmed directly via `ps -ef`
+  showing the resident's actual running path. The wrapper script is
+  rewritten **unconditionally on every startup** (unlike the gsettings
+  binding/marker logic elsewhere in this file, which deliberately writes
+  once) since the mount path is different every launch:
+  ```sh
+  if [ -x "$MOUNT_BIN" ]; then
+    exec "$MOUNT_BIN" --no-sandbox --toggle-popup
+  else
+    exec "$APPIMAGE_PATH" --toggle-popup
+  fi
+  ```
+  When a resident is already running (the overwhelming majority of hotkey
+  presses), this skips the FUSE mount and `AppRun` entirely. When no
+  resident is running (first launch, or after Quit — the old mount is
+  already torn down since nothing from it is still alive), it falls through
+  to the unchanged, already-tested cold-start path: the real `.AppImage`
+  file, which becomes the new resident and rewrites the wrapper with its
+  own fresh mount path on its next startup.
+
+  **`--no-sandbox` on the mount-bin branch is required, confirmed by a real
+  crash during testing, not assumed.** The first version omitted it,
+  reasoning (wrongly) that a losing instance calls
+  `app.requestSingleInstanceLock()`/`app.quit()` before creating any
+  window, so sandboxing wouldn't matter. In practice the crash happens
+  *before any of that JS runs at all* — Chromium's sandbox init happens
+  natively during process startup. Bypassing `AppRun` also bypasses its own
+  `unshare -Ur true` heuristic (the thing that decides whether to add
+  `--no-sandbox`), so a direct exec hit the exact FATAL `chrome-sandbox`
+  crash this project already ruled out for every *other* invocation path
+  (`pnpm start`, `setup.sh`'s hotkey command, the autostart entry — all of
+  which hardcode `--no-sandbox` unconditionally, per this project's
+  documented decision that the real sandbox doesn't work in this project's
+  target environment and deliberately avoids requiring the `sudo
+  chown`/`chmod` fix). Reproduced directly: invoking the wrapper without the
+  flag crashed with `FATAL:setuid_sandbox_host.cc... aborting now` every
+  time; adding `--no-sandbox` to just that branch fixed it, verified by
+  invoking the wrapper directly multiple times and confirming it correctly
+  signals the existing resident (same renderer PID throughout, no
+  duplicate window) rather than crashing or spawning a second instance.
+  Timing measured directly on this machine: full `.AppImage` invocation
+  ~2.4-2.6s, wrapper invocation ~0.5-0.6s — closing almost all of the gap
+  the user originally reported.
+
+  **Verification**: contrary to this project's earlier assumption that this
+  sandboxed dev environment lacks FUSE entirely (see the AppImage-testing
+  note elsewhere in this file), a genuine FUSE mount (`/tmp/.mount_XXXX`,
+  visible in `mount` as `type fuse.Clipboardian-1.0.0.AppImage`) was
+  actually obtained here on a plain direct launch (no
+  `--appimage-extract-and-run` needed) — so the full fast-path/fallback
+  cycle was verified end-to-end, not just reasoned about: (1) fast path
+  measured at ~0.5-0.6s vs. ~2.4-2.6s for the full `.AppImage` invocation,
+  same resident renderer PID throughout, no crash, no duplicate window;
+  (2) killing every process from the mount confirmed the mount and its
+  `/tmp/.mount_XXXX` directory both disappear on their own (`mount | grep
+  clipboardian` empty, directory gone) — confirming the refcounted
+  auto-unmount behavior the fallback design depends on; (3) invoking the
+  wrapper with no resident alive correctly fell through to
+  `$APPIMAGE_PATH`, which relaunched, mounted fresh at a new
+  `/tmp/.mount_XXXX` path, became the new resident, and rewrote the wrapper
+  with its own new mount path on startup — confirming the self-healing
+  cycle closes correctly. (Whether this particular dev sandbox actually has
+  working FUSE seems to vary by invocation/session — not worth chasing
+  further here, since it happened to work for this verification pass.)
+
+## Releasing
+
+`.github/workflows/release.yml` builds the AppImage and publishes a GitHub
+Release automatically whenever a tag matching `v*` is pushed. To cut a
+release:
+
+```bash
+pnpm version patch   # or minor/major — bumps package.json, commits, tags locally
+git push              # push the commit to main on its own
+git push --follow-tags   # main is already up to date, so this sends only the new tag
+```
+
+`pnpm version` (same as `npm version`) is the right tool for the
+version-bump step specifically because it keeps `package.json`'s version
+and the git tag in sync automatically — it bumps, commits, and creates an
+annotated tag pointing at that commit in one step, so there's no separate
+"remember to tag the same version" step to get out of sync. (For the very
+first release, where `package.json` already holds the target version and
+there's nothing to bump *from*, just tag directly instead:
+`git tag vX.Y.Z`, then push it the same two-step way below.)
+
+The workflow does the rest once the tag lands on GitHub (`pnpm install`,
+`pnpm test`, `pnpm run dist`, then `gh release create` with the built
+`.AppImage` attached, using GitHub's auto-generated release notes from
+commit history). The `pnpm test` step means a release build never ships
+if `store.ts`'s tests fail — see "Dev commands" above for what that suite
+does and doesn't cover. Nothing enforces the tag matching `package.json`'s
+version automatically when tagging directly (bypassing `pnpm version`);
+keep them in sync by convention so the release title and the `.AppImage`
+filename (`Clipboardian-<version>.AppImage`, derived from `package.json`)
+make sense together.
+
+**Correction — `git push --follow-tags` as a single, first push (branch
+and tag bundled together in one invocation) did not trigger
+`release.yml`, confirmed directly while cutting v1.0.0, not assumed.**
+After `pnpm version 1.0.0` followed immediately by `git push
+--follow-tags`, `git ls-remote --tags origin` confirmed the tag genuinely
+reached GitHub, yet the Actions tab showed **0 workflow runs** for
+`release.yml` — checked both via `WebFetch` and, after that looked
+unreliable for GitHub's JS-heavy Actions UI, confirmed directly by the
+user in their own authenticated browser. Fixed by deleting and re-pushing
+the tag as its own standalone push (`git push --delete origin vX.Y.Z`,
+then `git tag vX.Y.Z && git push origin vX.Y.Z`) — this time the workflow
+run showed up immediately. **The exact root cause (a "combined ref push"
+theory) was never 100% confirmed** — this is a working empirical pattern,
+not a fully explained one. The two-step flow above (`git push` for the
+branch, then a *separate* `git push --follow-tags` call) achieves the same
+"tag pushed on its own" effect, since by the time the second command runs
+the branch has nothing new to send — but until this has proven reliable
+across a few more releases, glance at the Actions tab right after pushing
+a tag rather than assuming it fired.
+
+**Correction — electron-builder's own implicit publish-on-tag behavior
+broke the first real CI run, confirmed via the actual failed run's log,
+not assumed.** `pnpm run dist`'s `electron-builder` step failed in CI
+(worked fine locally) with `⨯ GitHub Personal Access Token is not set,
+neither programmatically, nor using env "GH_TOKEN"`, preceded by `•
+Implicit publishing triggered by git tag. This behavior will be disabled
+in electron-builder v27.` — electron-builder detects a CI environment
+building from a git tag ref and assumes you want *it* to publish the
+release itself via its own built-in GitHub provider, which needs a
+`GH_TOKEN` env var this project never set (deliberately — `release.yml`
+already does its own explicit `gh release create` step afterward, so a
+second, electron-builder-driven publish would be redundant even if
+configured). Fixed by adding `--publish never` to the `dist` script in
+`package.json` (`"dist": "pnpm run build && electron-builder --linux
+AppImage --publish never"`) — opts out explicitly rather than relying on
+electron-builder's implicit-CI-detection default, which is being removed
+in v27 anyway. Verified by re-running the build in CI after this fix.
+
+No FUSE needed on the runner — packaging the AppImage doesn't require
+running it. `permissions: contents: write` is required at the workflow
+level for the default `GITHUB_TOKEN` to be allowed to create a release;
+without it the token is read-only and the release step fails. Works on a
+free GitHub account either way (public repos get unlimited free Actions
+minutes; private repos get 2,000 free minutes/month, far more than an
+occasional release build needs) — GitHub Releases themselves are free
+regardless of repo visibility or plan.
 
 ## How it was verified
 

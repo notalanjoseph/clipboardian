@@ -1,29 +1,63 @@
 {
   "name": "clipboardian",
-  "version": "1.0.0",
+  "version": "0.0.0",
   "description": "Local clipboard text history with a global-hotkey search popup",
+  "desktopName": "clipboardian.desktop",
+  "author": "Alan Joseph",
   "license": "GPL-3.0-or-later",
   "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/notalanjoseph/clipboardian.git"
+  },
+  "homepage": "https://github.com/notalanjoseph/clipboardian#readme",
+  "bugs": {
+    "url": "https://github.com/notalanjoseph/clipboardian/issues"
+  },
   "main": "build/main/main.js",
   "scripts": {
     "build": "tsc -p tsconfig.json && mkdir -p build/renderer && cp src/renderer/index.html src/renderer/styles.css src/renderer/tray-icon.png build/renderer/",
     "postinstall": "electron-rebuild -f -w better-sqlite3",
-    "start": "pnpm run build && electron --no-sandbox ."
+    "start": "pnpm run build && electron --no-sandbox .",
+    "test": "pnpm run build && ELECTRON_RUN_AS_NODE=1 electron --test build",
+    "dist": "pnpm run build && electron-builder --linux AppImage --publish never"
   },
   "dependencies": {
-    "electron": "^33.0.0",
     "better-sqlite3": "^11.0.0"
   },
   "devDependencies": {
-    "typescript": "^5.6.0",
-    "@types/node": "^22.0.0",
+    "@electron/rebuild": "^3.7.0",
     "@types/better-sqlite3": "^7.6.0",
-    "@electron/rebuild": "^3.7.0"
+    "@types/node": "^22.0.0",
+    "electron": "^33.0.0",
+    "electron-builder": "^26.15.3",
+    "typescript": "^5.6.0"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
       "electron",
       "better-sqlite3"
     ]
+  },
+  "build": {
+    "appId": "in.hatio.clipboardian",
+    "productName": "Clipboardian",
+    "directories": {
+      "output": "dist",
+      "buildResources": "resources"
+    },
+    "files": [
+      "build/**/*",
+      "package.json"
+    ],
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Utility",
+      "icon": "resources/icon.png",
+      "synopsis": "Local clipboard text history with a global-hotkey search popup",
+      "syncDesktopName": true
+    }
   }
 }
