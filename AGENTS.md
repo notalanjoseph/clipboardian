@@ -492,6 +492,84 @@ Don't re-attempt these without re-reading why they were rejected:
   (~0.3s measured). Don't build a custom IPC channel for this — Electron
   already provides it.
 
+- **Rounded corners on the popup window (`BrowserWindow` `transparent: true`
+  + CSS `border-radius`) were attempted and reverted — genuinely doesn't
+  work on this machine (GNOME 46 / Mutter), confirmed by exhausting every
+  documented fix, not given up on prematurely.** Symptom, reported directly
+  by the user with an exaggerated diagnostic style (40px radius + solid red
+  4px outline ring, to make any partial success unambiguous): the **top**
+  two corners stayed perfectly square/opaque, while the **bottom** two
+  showed the red curve — but with **solid black**, not the desktop, filling
+  the area outside the curve. That asymmetry matters: `border-radius`/
+  `box-shadow` are the same CSS rule applied uniformly to the whole
+  element, so a pure page-rendering bug can't explain top behaving
+  differently from bottom — this pointed at window-compositor-level
+  interference, not a CSS mistake, which is exactly what made this worth
+  chasing across several distinct mechanisms rather than assuming failure
+  after the first attempt.
+
+  Verified independently, via tools that turned out to work despite this
+  project's documented general GUI-testing limitations (see "How it was
+  verified" below) — this app happens to run as an **XWayland** client by
+  default (real X11 surface, `DISPLAY=:0` set), which made `xwininfo`
+  usable even though `grim`/GNOME's screenshot D-Bus API are both
+  confirmed dead ends as always: `xwininfo` showed the window genuinely
+  had a 32-bit `TrueColor` ARGB-capable visual, and Chrome DevTools
+  Protocol confirmed the computed CSS was 100% correct (`border-radius`,
+  `box-shadow`, `html { background: rgba(0,0,0,0) }` all present) on the
+  exact running instance. A `Page.captureScreenshot` CDP test was tried and
+  found **unreliable** for this specific question — it returned
+  byte-identical output regardless of `Emulation.setDefaultBackgroundColorOverride`,
+  suggesting CDP screenshots don't faithfully reflect real window-compositor
+  alpha at all; don't trust that API for this again.
+
+  Five independent fixes were tried, **each individually confirmed to
+  actually take effect** (not silently ignored) before being ruled out —
+  none changed the visual result even slightly:
+  1. `backgroundColor: '#00000000'` alongside `transparent: true` (the most
+     commonly cited fix for Linux — explicit zero-alpha RGBA, not the
+     string `'transparent'`).
+  2. `app.disableHardwareAcceleration()` (the single most-cited historical
+     fix for this class of bug — alpha lost in the GPU present path).
+  3. Forcing native Wayland instead of XWayland
+     (`--ozone-platform=wayland`). **Important finding while testing
+     this**: `app.commandLine.appendSwitch('ozone-platform', 'wayland')`
+     from within the app's own JS **does not work** — confirmed via
+     `xwininfo` still finding an X11 surface afterward, and via the
+     renderer subprocess's own args never actually containing
+     `--ozone-platform=wayland`. Only passing it as a genuine CLI argument
+     at process-spawn time actually forced native Wayland (confirmed via
+     `xwininfo` then finding *nothing* — the window was no longer an X11
+     surface at all). Some Ozone/platform decisions are made too early in
+     Chromium's native startup for `app.commandLine.appendSwitch()` calls
+     to influence, even when called before `app.whenReady()`. Despite
+     genuinely being native Wayland this time (confirmed, not assumed),
+     the visual result was — per the user directly — "exact same as
+     before."
+  4. `--enable-transparent-visuals` combined with `--disable-gpu` (per the
+     research pairing warning: this flag alone, without disabling GPU, is
+     reported elsewhere to cause unintended semi-transparency on *all*
+     windows — tried only paired with #2, still no change).
+  5. `hasShadow: false` — a different hypothesis entirely (that the solid
+     black might be a GNOME/Mutter-added window-manager shadow, not
+     Chromium's own page rendering, since the asymmetry pointed away from
+     anything page-level). Also no change.
+
+  That level of consistency — zero visual difference across GPU on/off,
+  XWayland vs. confirmed-genuine native Wayland, shadow on/off, and every
+  documented transparency flag — is itself the real finding: this isn't a
+  missing-flag problem. It points to something more fundamental in how
+  this specific Mutter version composites frameless/transparent Electron
+  windows that isn't addressable from the app side with current knowledge.
+  **Reverted cleanly** (`git diff` against the last commit was empty after
+  reverting — byte-perfect, confirmed via `git status`) rather than left in
+  a half-broken state, since partial failure (black corner triangles) looks
+  worse than the plain rectangular popup that shipped before this attempt.
+  Don't re-attempt without new information — e.g. a different Electron/
+  Chromium version, a Mutter update, or an actual root-cause explanation
+  found in a future upstream bug report, not just retrying the same five
+  mechanisms.
+
 ## Packaging (AppImage via electron-builder)
 
 - **`electron` must be a `devDependency`, not a regular `dependency`.**

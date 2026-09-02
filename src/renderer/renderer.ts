@@ -38,6 +38,7 @@ function render(): void {
     const li = document.createElement('li');
     li.textContent = summarize(entry.text);
     if (i === selectedIndex) li.classList.add('selected');
+    li.addEventListener('mouseenter', () => highlight(i));
     li.addEventListener('mousedown', (e) => {
       e.preventDefault();
       choose(i);
@@ -47,9 +48,11 @@ function render(): void {
 }
 
 function highlight(index: number): void {
+  const prevEl = listEl.children[selectedIndex] as HTMLElement | undefined;
+  prevEl?.classList.remove('selected');
   selectedIndex = index;
-  render();
   const el = listEl.children[selectedIndex] as HTMLElement | undefined;
+  el?.classList.add('selected');
   el?.scrollIntoView({ block: 'nearest' });
 }
 

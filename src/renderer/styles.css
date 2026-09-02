@@ -31,6 +31,23 @@ body {
   flex: 1;
 }
 
+#list::-webkit-scrollbar {
+  width: 8px;
+}
+
+#list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+#list::-webkit-scrollbar-thumb {
+  background: #3a3a3a;
+  border-radius: 4px;
+}
+
+#list::-webkit-scrollbar-thumb:hover {
+  background: #4a4a4a;
+}
+
 #list li {
   padding: 8px 10px;
   border-radius: 6px;
