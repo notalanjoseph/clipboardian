@@ -203,3 +203,8 @@ EOF
 echo "Installed autostart entry: $AUTOSTART_FILE (will launch on next login)"
 
 echo "Setup complete. Run 'pnpm start' to try it now, or log out/in to pick up autostart."
+
+if [[ -z "$BINDING" ]] && command -v gnome-control-center &>/dev/null; then
+  echo "Opening GNOME Settings so you can bind one manually..."
+  XDG_CURRENT_DESKTOP=GNOME gnome-control-center keyboard shortcuts >/dev/null 2>&1 &
+fi

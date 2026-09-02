@@ -1,4 +1,4 @@
-import { execFileSync } from 'child_process';
+import { execFile, execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -20,6 +20,18 @@ function autostartMarkerFile(): string {
 
 function hotkeyMarkerFile(): string {
   return path.join(app.getPath('userData'), '.hotkey-managed');
+}
+
+// Separate from hotkeyMarkerFile(): that one means "the hotkey question is
+// permanently resolved" and is deliberately never written while both
+// candidates are taken, so ensureHotkey() keeps retrying every launch. This
+// one tracks a narrower thing — "has the user already been told about the
+// both-taken situation at least once" — so repeat launches (still
+// unresolved) don't re-fire the first-run notification/Settings popup
+// forever, and isHotkeyConfigured() can correctly tell main.ts this isn't a
+// genuinely first-ever launch even though the hotkey itself stayed unbound.
+function noFreeHotkeyNotifiedMarkerFile(): string {
+  return path.join(app.getPath('userData'), '.no-free-hotkey-notified');
 }
 
 function log(message: string): void {
@@ -44,10 +56,10 @@ function humanizeBinding(binding: string): string {
     .replace(/(.)$/, (c) => c.toUpperCase());
 }
 
-function showNotification(body: string): void {
+function showNotification(title: string, body: string): void {
   try {
     if (!Notification.isSupported()) return;
-    new Notification({ title: 'Clipboardian', body }).show();
+    new Notification({ title, body }).show();
   } catch (err) {
     log(`notification failed: ${err}`);
   }
@@ -59,14 +71,17 @@ function showNotification(body: string): void {
 // (this matters especially for the Super+Shift+V fallback case, which they
 // wouldn't otherwise know to try).
 function notifyHotkeyBound(binding: string): void {
-  showNotification(`Press ${humanizeBinding(binding)} to open your clipboard history.`);
+  showNotification(
+    "Clipboardian installed",
+    `To open clipboard history press ${humanizeBinding(binding)}`,
+  );
 }
 
 function notifyNoFreeHotkey(): void {
   showNotification(
-    "Couldn't find a free hotkey (Super+V and Super+Shift+V are both " +
-      'taken) — please bind one manually in GNOME Settings → Keyboard → ' +
-      'Keyboard Shortcuts → Custom Shortcuts → "Clipboardian".',
+    'Clipboardian installed | Action required',
+    'Could not find a free hotkey. Bind one manually in ' +
+      'GNOME Settings → Keyboard → Keyboard Shortcuts → Custom Shortcuts → "Clipboardian".',
   );
 }
 
@@ -267,14 +282,79 @@ except (ValueError, SyntaxError):
 print(val if isinstance(val, str) else '')
 `;
 
+// Unquotes a GVariant string literal (what `gsettings get` prints for a
+// string-typed key, e.g. `'<Super>v'` or `''`) without spawning python3.
+// Everywhere else in this file uses PY_VALUE_OR_EMPTY/ast.literal_eval for
+// this, which is the right call for one-shot per-launch reads — but
+// currentBindingLabel() is polled every few seconds for as long as the app
+// is resident (main.ts's tray-refresh interval), so avoiding a second
+// subprocess spawn on every tick is worth the narrower parsing logic here.
+// Safe specifically because this key's value is always either empty or a
+// simple accelerator string (only ever written by our own gset() calls or
+// GNOME Settings' own UI) — never anything containing quotes/newlines that
+// would need real escape-sequence handling. Falls back to '' for anything
+// that isn't cleanly quote-delimited, mirroring PY_VALUE_OR_EMPTY's own
+// fallback for unparseable input.
+function unquoteGVariantString(raw: string): string {
+  const trimmed = raw.trim();
+  const quote = trimmed[0];
+  if (trimmed.length >= 2 && (quote === "'" || quote === '"') && trimmed.endsWith(quote)) {
+    return trimmed.slice(1, -1);
+  }
+  return '';
+}
+
 // Reads whatever the hotkey binding *currently* is — the default we picked,
 // or something the user rebound manually via GNOME Settings — for display
-// in launch notifications. Returns null if unset/unreadable.
-function currentBindingLabel(): string | null {
+// in launch notifications and the tray menu. Returns null if unset/unreadable.
+// Not gated on process.env.APPIMAGE: setup.sh (dev mode) and this file's own
+// first-run setup both write into the same gsettings slot, so a plain read
+// works correctly regardless of which one configured it.
+export function currentBindingLabel(): string | null {
   const raw = gget(CUSTOM_SCHEMA, 'binding');
   if (!raw.ok) return null;
-  const value = pyRun(PY_VALUE_OR_EMPTY, [raw.raw]).stdout;
+  const value = unquoteGVariantString(raw.raw);
   return value ? humanizeBinding(value) : null;
+}
+
+// Opens GNOME's own Keyboard Shortcuts settings so the user can rebind
+// manually — reuses GNOME's real shortcut editor (with its own conflict
+// detection/UI) rather than building a custom key-capture dialog. "keyboard
+// shortcuts" is a documented gnome-control-center invocation (confirmed via
+// the actual man page, not just assumed) that opens directly to the
+// shortcuts tab; it can't deep-link any further to the specific
+// "Clipboardian" row within Custom Shortcuts — GNOME doesn't expose that
+// level of navigation via the CLI, so the user still scrolls to it
+// themselves, same as this project's own README instructions. Not gated on
+// process.env.APPIMAGE, matching currentBindingLabel() — this is a general
+// runtime action, not a first-run setup step.
+//
+// XDG_CURRENT_DESKTOP is forced to 'GNOME' explicitly, confirmed necessary
+// by testing, not assumption: gnome-control-center refuses to start at all
+// ("Running gnome-control-center is only supported under GNOME and Unity,
+// exiting") unless it sees that variable — and however this app itself got
+// launched (hotkey press, AppImage bootstrap), its own process environment
+// doesn't reliably carry it, even though a real interactive desktop session
+// has it set. Reproduced directly: spawning gnome-control-center with
+// XDG_CURRENT_DESKTOP stripped hit this exact error; forcing it back fixed
+// it. Safe to hardcode 'GNOME' since this project already assumes a GNOME
+// session everywhere else (the gsettings schemas it reads/writes).
+export function openHotkeySettings(): void {
+  execFile(
+    'gnome-control-center',
+    ['keyboard', 'shortcuts'],
+    { env: { ...process.env, XDG_CURRENT_DESKTOP: 'GNOME' } },
+    (err) => {
+      if (err) {
+        log(`failed to open GNOME Settings: ${err}`);
+        showNotification(
+          'Clipboardian | Action required',
+          'Could not open GNOME Settings automatically — open it manually: ' +
+            'Settings → Keyboard → View and Customize Shortcuts → Custom Shortcuts.',
+        );
+      }
+    },
+  );
 }
 
 function wrapperScriptFile(): string {
@@ -326,7 +406,12 @@ function ensureFastToggleWrapper(appimagePath: string): string {
   return wrapperPath;
 }
 
-function ensureHotkey(appimagePath: string): void {
+// Returns whether this call fired a notification (notifyHotkeyBound or
+// notifyNoFreeHotkey) — main.ts uses this to avoid also firing
+// notifyRelaunched() in the same launch, which would otherwise show two
+// contradictory notifications back to back on a launch where a previously
+// unresolvable hotkey becomes bindable (see AGENTS.md correction).
+function ensureHotkey(appimagePath: string): boolean {
   const expectedCommand = ensureFastToggleWrapper(appimagePath);
 
   const arrResult = gget(BASE, 'custom-keybindings');
@@ -338,9 +423,9 @@ function ensureHotkey(appimagePath: string): void {
     const appended = pyRun(PY_ARRAY_APPEND, [rawArray, SLOT_PATH]);
     if (!appended.ok) {
       log('could not parse custom-keybindings array; skipping hotkey setup');
-      return;
+      return false;
     }
-    if (!gset(BASE, 'custom-keybindings', appended.stdout)) return;
+    if (!gset(BASE, 'custom-keybindings', appended.stdout)) return false;
     slotWasMissing = true;
     log(`registered new custom keybinding slot: ${SLOT_PATH}`);
   }
@@ -382,7 +467,7 @@ function ensureHotkey(appimagePath: string): void {
       fs.mkdirSync(path.dirname(marker), { recursive: true });
       fs.writeFileSync(marker, '');
       log(`hotkey already bound to ${currentBinding}; leaving as-is`);
-      return;
+      return false;
     }
 
     const superVFree = pyRun(PY_FIND_CONFLICT, ['<Super>v', SLOT_PATH]).ok;
@@ -399,14 +484,32 @@ function ensureHotkey(appimagePath: string): void {
         fs.writeFileSync(marker, '');
         log(`hotkey bound to ${binding}`);
         notifyHotkeyBound(binding);
+        return true;
       }
     } else {
-      // Both candidates taken — don't write an unusable binding. Marker is
-      // deliberately NOT written, so this retries on every future launch.
+      // Both candidates taken — don't write an unusable binding. The
+      // *resolved* marker is deliberately NOT written, so this keeps
+      // retrying every future launch until one frees up or the user binds
+      // one manually.
       log('could not find a free hotkey: Super+V and Super+Shift+V are both taken');
-      notifyNoFreeHotkey();
+      // But only notify/open Settings the first time this is discovered —
+      // otherwise every single relaunch (e.g. via autostart on login) would
+      // re-fire the same notification and re-pop Settings open forever.
+      const noFreeHotkeyMarker = noFreeHotkeyNotifiedMarkerFile();
+      if (!fs.existsSync(noFreeHotkeyMarker)) {
+        fs.mkdirSync(path.dirname(noFreeHotkeyMarker), { recursive: true });
+        fs.writeFileSync(noFreeHotkeyMarker, '');
+        notifyNoFreeHotkey();
+        // Only pop open Settings when the user actually needs to act —
+        // a successful auto-bind above needs no follow-up, but this message
+        // already tells them to bind one manually, so opening it directly
+        // removes that friction entirely.
+        openHotkeySettings();
+        return true;
+      }
     }
   }
+  return false;
 }
 
 function writeAutostartFile(appimagePath: string): void {
@@ -450,13 +553,19 @@ function ensureAutostart(appimagePath: string): void {
   }
 }
 
-// Whether the hotkey has ever been configured before (i.e. this isn't a
-// genuinely first-ever launch) — used by main.ts to decide whether a plain
-// double-click relaunch should get its own notification, or whether
-// ensureHotkeyAndAutostart's one-time first-run notification already covers
-// it (avoids showing both back to back on true first launch).
+// Whether the hotkey question has already been addressed once before (i.e.
+// this isn't a genuinely first-ever launch) — used by main.ts to decide
+// whether a plain double-click relaunch should get its own notification, or
+// whether ensureHotkeyAndAutostart's one-time first-run notification already
+// covers it (avoids showing both back to back on true first launch). Checks
+// both markers since "addressed" has two distinct shapes: successfully
+// bound (hotkeyMarkerFile), or discovered-and-reported-unbound at least once
+// (noFreeHotkeyNotifiedMarkerFile) — without the second check, a permanently
+// unresolved "both taken" launch would (bug, found via testing) look
+// identical to a genuinely first-ever launch on every single relaunch,
+// since the resolved marker is deliberately never written in that case.
 export function isHotkeyConfigured(): boolean {
-  return fs.existsSync(hotkeyMarkerFile());
+  return fs.existsSync(hotkeyMarkerFile()) || fs.existsSync(noFreeHotkeyNotifiedMarkerFile());
 }
 
 // Both gated on process.env.APPIMAGE, matching ensureHotkeyAndAutostart —
@@ -467,7 +576,10 @@ export function notifyAlreadyRunning(): void {
   if (!process.env.APPIMAGE) return;
   const label = currentBindingLabel();
   showNotification(
-    label ? `Already running — press ${label} to open it.` : 'Already running.',
+    "Clipboardian | Running",
+    label
+      ? `Clipboardian is already running in background — to open it press ${label}`
+      : "Clipboardian is already running in background. Change Hotkey to start using it.",
   );
 }
 
@@ -475,9 +587,10 @@ export function notifyRelaunched(): void {
   if (!process.env.APPIMAGE) return;
   const label = currentBindingLabel();
   showNotification(
+    "Clipboardian | Started",
     label
-      ? `Running in the background — press ${label} to open it.`
-      : 'Running in the background.',
+      ? `To open clipboard history press ${label}`
+      : "Change Hotkey to start using Clipboardian.",
   );
 }
 
@@ -486,12 +599,18 @@ export function notifyRelaunched(): void {
 // path — confirmed present even under --appimage-extract-and-run). Dev-mode
 // `electron .`/`pnpm start` never has this set, so this is a no-op there;
 // that flow still relies on setup.sh, unchanged.
-export function ensureHotkeyAndAutostart(): void {
+//
+// Returns whether ensureHotkey() fired a notification this run — main.ts
+// uses this to decide whether notifyRelaunched() also needs to fire, so a
+// launch that both relaunches *and* newly resolves the hotkey doesn't show
+// two contradictory notifications back to back.
+export function ensureHotkeyAndAutostart(): boolean {
   const appimagePath = process.env.APPIMAGE;
-  if (!appimagePath) return;
+  if (!appimagePath) return false;
 
+  let notified = false;
   try {
-    ensureHotkey(appimagePath);
+    notified = ensureHotkey(appimagePath);
   } catch (err) {
     log(`hotkey setup failed: ${err}`);
   }
@@ -501,6 +620,8 @@ export function ensureHotkeyAndAutostart(): void {
   } catch (err) {
     log(`autostart setup failed: ${err}`);
   }
+
+  return notified;
 }
 
 // Reverses whatever's registered under SLOT_PATH, regardless of whether
@@ -535,7 +656,11 @@ export function uninstall(): void {
   }
 
   try {
-    for (const marker of [hotkeyMarkerFile(), autostartMarkerFile()]) {
+    for (const marker of [
+      hotkeyMarkerFile(),
+      autostartMarkerFile(),
+      noFreeHotkeyNotifiedMarkerFile(),
+    ]) {
       if (fs.existsSync(marker)) fs.unlinkSync(marker);
     }
   } catch (err) {

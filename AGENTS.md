@@ -285,6 +285,204 @@ Don't re-attempt these without re-reading why they were rejected:
   free hotkey: Super+V and Super+Shift+V are both taken` with the binding
   left `''` — instead of wrongly claiming `<Super><Shift>v`.
 
+- **The tray menu's hotkey label opens GNOME's own Keyboard Shortcuts
+  settings (`gnome-control-center keyboard shortcuts`) rather than a custom
+  in-app key-capture dialog.** Consistent with this project's broader
+  stance of leaning on native GNOME functionality instead of reinventing it
+  (gsettings custom-keybindings instead of Electron's `globalShortcut`,
+  GNOME's own Custom Shortcuts UI as the documented way to rebind) —
+  building a custom key-capture UI would duplicate GNOME's own shortcut
+  editor and its conflict detection, for no real benefit.
+  `keyboard shortcuts` (the two args together) is a **documented**
+  `gnome-control-center` invocation, confirmed via the actual Ubuntu man
+  page text, not just a search-engine summary: "You can open this panel on
+  a specific tab by passing typing or shortcuts as extra argument." Also
+  confirmed to actually launch on this machine (process stayed alive under
+  a `timeout` wrapper, no immediate crash). **Real limitation, not fixable
+  via CLI**: GNOME doesn't support deep-linking to a *specific* custom
+  shortcut row — only to the shortcuts tab as a whole — so the user still
+  scrolls to "Custom Shortcuts" → "Clipboardian" themselves, same as this
+  project's own README instructions.
+
+  **The tray menu doesn't auto-refresh after the user rebinds via
+  Settings** — Electron's own bundled type docs confirm `Tray` emits a
+  `'click'` event on Linux, but with this exact caveat: "this event is
+  emitted when the tray icon receives an activation, which might not
+  necessarily be left mouse click." A `tray.on('click', ...)` handler that
+  rebuilds the menu was added anyway since it's cheap and harmless even if
+  it never fires as hoped, but its actual timing relative to the OS
+  auto-showing the attached context menu was **not verified** — this
+  sandboxed dev environment has no GUI interaction tooling (see "How it was
+  verified" below), so this is a best-effort addition, not a confirmed
+  live-refresh. If it turns out not to work in practice, the menu still
+  self-corrects at the next natural rebuild point (app restart).
+
+  **Correction — confirmed by the user in real use that `tray.on('click',
+  ...)` does not work: changing or unsetting the hotkey via GNOME Settings
+  left the tray label stale until the app was quit and relaunched.**
+  Exactly the risk flagged as unverified above — GNOME's tray protocol
+  (StatusNotifierItem/AppIndicator) shows whatever `Menu` was last passed
+  to `setContextMenu()` directly, with no reliable hook for Electron to
+  rebuild it first. Replaced with a `setInterval` poll (3s) that re-reads
+  `currentBindingLabel()` and only calls `setContextMenu()` when the value
+  actually changed (not on every tick, to avoid redundant D-Bus menu
+  re-exports). `buildTrayMenu()` was refactored to take the binding as a
+  parameter instead of reading it internally, so the poll and the two
+  startup call sites all share one source of truth
+  (`lastKnownBinding`) instead of each re-querying gsettings separately.
+  Verified directly using this project's established temporary-debug-log
+  technique (see "How it was verified" below): ran a dev-mode instance,
+  changed the real gsettings binding externally (`gsettings set ...`,
+  exactly what GNOME Settings does under the hood) to `<Control><Alt>v`,
+  confirmed the poll logged the rebuild with the correctly humanized
+  `Ctrl+Alt+V` within one interval tick, then cleared the binding
+  entirely and confirmed the same for the `null`/"not set" case — before
+  removing the debug log and rebuilding.
+
+  **Correction — clicking the menu item showed the fallback notification
+  instead of opening Settings, confirmed via `appimage-setup.log`'s actual
+  error text, not assumed.** The log showed
+  `gnome-control-center` itself exiting immediately with `Running
+  gnome-control-center is only supported under GNOME and Unity, exiting`
+  — its own startup check refuses to run unless it sees `GNOME` or `Unity`
+  in `XDG_CURRENT_DESKTOP`. Confirmed directly: the *running app's own
+  process* had **no `XDG_CURRENT_DESKTOP` set at all**
+  (`cat /proc/<pid>/environ`), unlike a normal interactive shell/session
+  (which has `ubuntu:GNOME`) — however this app itself gets launched
+  (hotkey press, AppImage bootstrap) doesn't reliably carry that variable
+  through, so `execFile()`'s spawned child inherited the same gap. Fixed
+  by explicitly forcing `XDG_CURRENT_DESKTOP: 'GNOME'` in the env passed to
+  `execFile()` — safe to hardcode since this project already assumes a
+  GNOME session everywhere else (the gsettings schemas it reads/writes).
+  Verified by reproducing the exact failure first (spawning
+  `gnome-control-center` with `XDG_CURRENT_DESKTOP` stripped via `env -u`
+  hit the identical error), then confirming the forced-env version actually
+  launches and stays running under the same stripped-env condition.
+
+  **Correction — the 3s tray-refresh poll's real cost was quoted wrong when
+  the user asked directly whether it was resource-intensive.** Answered
+  "~3ms per tick" based on timing a bare `gsettings get` call alone — but
+  `currentBindingLabel()` (what the poll actually calls) also spawns a
+  `python3` subprocess via `pyRun(PY_VALUE_OR_EMPTY, ...)` to parse that
+  output, found later by code review, not from re-checking the original
+  answer. Measured the real, complete cost directly: ~21-25ms per tick
+  (`gsettings get` + `python3 -c ...` back to back), confirmed via `strace
+  -f -e trace=execve` showing both processes actually exec'd once per call.
+  Still genuinely negligible in absolute terms (~0.7% of one core), but the
+  original answer undersold it by ~7x by only benchmarking half the actual
+  code path. Fixed the underlying cost rather than just correcting the
+  number: added `unquoteGVariantString()`, a narrow, JS-only unquoter for
+  this one specific value shape (gsettings' GVariant string-literal output
+  is always empty or a simple accelerator string here, never anything
+  needing real escape-sequence handling) — used *only* in
+  `currentBindingLabel()`, since that's the one call site that's polled
+  forever rather than called once per launch; every other
+  `PY_VALUE_OR_EMPTY`/`ast.literal_eval` call site in this file is
+  untouched, since a one-shot per-launch python3 spawn was never the
+  concern. Verified with the same `strace` technique: confirmed `python3`
+  is exec'd zero times now, `currentBindingLabel()` still correctly returns
+  `Super+V` for a real bound value and `null` for an empty one, and the
+  per-tick cost is back down to ~5ms (matching what a bare `gsettings get`
+  alone actually costs).
+
+- **Both `setup.sh` and `ensureHotkey()` (AppImage) automatically open
+  GNOME's Keyboard Shortcuts settings — but only in the "both taken, left
+  unbound" case, not on a successful auto-bind.** Reuses the same
+  `openHotkeySettings()`/`gnome-control-center keyboard shortcuts`
+  mechanism as the tray menu item above. Deliberately scoped narrower than
+  first implemented: an early version opened Settings on *every* outcome
+  (including a successful Super+V/Super+Shift+V auto-bind), but that's
+  unnecessary friction — a successful bind needs no follow-up action from
+  the user. It's specifically the "couldn't find a free hotkey" message
+  that already tells the user to bind one manually via Settings, so
+  automatically opening it right there removes that friction where it
+  actually matters. In `ensureHotkey()`, this lives in the same
+  `else` branch as `notifyNoFreeHotkey()`; in `setup.sh`, it's gated on
+  `[[ -z "$BINDING" ]]` at the very end of the script (backgrounded, with
+  `XDG_CURRENT_DESKTOP=GNOME` forced the same way as the fix above, as
+  cheap insurance even though a normal interactive terminal session
+  already carries it correctly).
+
+  **Correction — quitting while both hotkeys were taken, then relaunching,
+  showed `notifyNoFreeHotkey()`'s "Clipboardian installed | Action
+  required" notification again instead of `notifyRelaunched()`'s
+  "Clipboardian | Started"**, reported directly by the user hitting this
+  in real use, not theorized. Root cause: `isHotkeyConfigured()` (which
+  `main.ts` uses to decide "is this a genuinely first-ever launch, or a
+  later relaunch") only checked `hotkeyMarkerFile()` — the marker meaning
+  "the hotkey question is *resolved*", which is deliberately never written
+  while both candidates stay taken (so `ensureHotkey()` keeps retrying
+  every launch, by design). That made every single relaunch
+  indistinguishable from a true first-ever launch, so
+  `ensureHotkeyAndAutostart()`'s own first-run notification kept re-firing
+  — with a title that says "installed" even on the tenth relaunch — and
+  `notifyRelaunched()` never got a chance to run at all. Fixed by adding a
+  second, narrower marker (`noFreeHotkeyNotifiedMarkerFile()`,
+  `.no-free-hotkey-notified`) that tracks "has the user been told about
+  this at least once" separately from "is it resolved" — gating
+  `notifyNoFreeHotkey()`/`openHotkeySettings()` behind it (write once, skip
+  on every later launch) and OR-ing it into `isHotkeyConfigured()`'s check.
+  Deliberately did **not** just reword `notifyNoFreeHotkey()`'s title —
+  the real bug was the missing "already notified" tracking, not the text;
+  once fixed, the existing "installed" title is accurate again for the one
+  launch it's actually allowed to fire on. Verified directly against this
+  project's own real machine state, which happened to already be in
+  exactly this bug's condition (`binding` empty, `toggle-message-tray`
+  claiming Super+V, neither marker present): confirmed `isHotkeyConfigured()`
+  flips `false` → `true` after the first simulated launch, and that a
+  second simulated launch no longer re-spawns `gnome-control-center`
+  (i.e. no duplicate notification/Settings-open), while the underlying
+  retry-until-resolved log line still fires every time as designed.
+
+  **Correction — the fix above introduced its own bug: Uninstall, then
+  reinstalling by relaunching the AppImage, showed `notifyRelaunched()`
+  ("Clipboardian | Started") instead of the correct fresh-install
+  notification**, reported directly by the user, not theorized. Root
+  cause: `uninstall()`'s marker cleanup list
+  (`[hotkeyMarkerFile(), autostartMarkerFile()]`) predates
+  `noFreeHotkeyNotifiedMarkerFile()` and was never updated to include it —
+  so uninstalling left the stale "already notified" marker sitting in
+  `userData`, and the next launch's `isHotkeyConfigured()` read it as
+  "this isn't a first-ever launch" even though the user had just
+  deliberately uninstalled and was reinstalling fresh. Fixed by adding
+  `noFreeHotkeyNotifiedMarkerFile()` to that same cleanup list. General
+  lesson for this file: **any new marker file needs a corresponding entry
+  in `uninstall()`'s cleanup list**, or it silently survives an uninstall
+  and corrupts the next install's first-run detection — this is the
+  second time a marker has been added to this file
+  (`noFreeHotkeyNotifiedMarkerFile` itself), so check this list first when
+  adding a third. Verified directly: called `uninstall()` for real on this
+  machine and confirmed via `ls` that all three marker files
+  (`.hotkey-managed`, `.autostart-managed`, `.no-free-hotkey-notified`) were
+  actually removed, then confirmed `isHotkeyConfigured()` correctly read
+  `false` again before the simulated reinstall ran.
+
+  **Correction — found by code review (not user report this time), then
+  confirmed real: a launch that both "relaunches" (per the sticky
+  `isHotkeyConfigured()` above) *and* newly resolves the hotkey in the same
+  run showed two contradictory notifications back to back** —
+  `notifyRelaunched()`'s stale "Change Hotkey to start using Clipboardian"
+  immediately followed by `notifyHotkeyBound()`'s "Clipboardian installed —
+  press Super+V". Root cause: `alreadyConfigured` (and thus the
+  `notifyRelaunched()` decision) is computed in `main.ts` *before*
+  `ensureHotkeyAndAutostart()` runs, so it can't know whether *this exact
+  launch* is about to also fire its own notification. Fixed by having
+  `ensureHotkey()`/`ensureHotkeyAndAutostart()` return whether they fired a
+  notification this run, and deferring the `notifyRelaunched()` decision in
+  `main.ts` until after `ensureHotkeyAndAutostart()` completes — gated on
+  `!notifiedByHotkeySetup`. This required reordering `main.ts`'s
+  `whenReady()` (`ensureHotkeyAndAutostart()` no longer strictly "runs
+  last"), but `popupWindow.toggle()` for a hotkey-triggered launch still
+  fires first/unblocked beforehand, so the reordering doesn't reintroduce
+  the startup-delay concern the original "run last" comment was about —
+  only the non-performance-critical relaunch-notification decision moved.
+  Verified directly: simulated the exact bug scenario (marker says
+  "already notified about both-taken", binding empty, then freed up
+  Super+V before the next launch) and confirmed `ensureHotkeyAndAutostart()`
+  now returns `true` (correctly suppressing `notifyRelaunched()`), then
+  re-ran with nothing changed and confirmed it returns `false` (so the
+  normal steady-state relaunch notification is unaffected).
+
 - **Reaching the resident instance is `app.requestSingleInstanceLock()` +
   `second-instance`**, not a hand-rolled socket/D-Bus service. Every hotkey
   press launches a short-lived `electron ... --toggle-popup` process; the

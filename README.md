@@ -18,6 +18,7 @@ Two ways to setup Clipboardian — pick one.
 
 **Prerequisite: FUSE** — lets an AppImage self-mount and run at all.
 One-time, system-wide install:
+
 ```bash
 sudo apt install libfuse2   # most Ubuntu versions
 ```
@@ -25,6 +26,7 @@ sudo apt install libfuse2   # most Ubuntu versions
 Download the latest `.AppImage` from the [Releases page](../../releases).
 
 Double-click the AppImage or run it from a terminal:
+
 ```bash
 ./Clipboardian-<version>.AppImage
 ```
@@ -36,6 +38,7 @@ After downloading the AppImage, run:
 ```bash
 ./Clipboardian-<version>.AppImage --appimage-extract-and-run
 ```
+
 </details>
 
 <details>
@@ -46,6 +49,7 @@ git clone https://github.com/notalanjoseph/clipboardian.git
 cd clipboardian
 pnpm run dist   # produces dist/Clipboardian-<version>.AppImage
 ```
+
 </details>
 
 ### Option 2: Using source code
@@ -59,8 +63,10 @@ cd clipboardian
 chmod +x ./setup.sh
 ./setup.sh
 ```
+
 The setup script installs deps, builds, registers the hotkey, sets up autostart.
 Autostart won't kick in until your next login, so to try it immediately:
+
 ```bash
 pnpm start   # quits cleanly on Ctrl+C, or use the tray icon's Quit
 ```
@@ -119,7 +125,6 @@ git push --follow-tags   # push the new tag
   natural for a keyboard-driven popup.
 - **Configurable history size.** The 500-entry cap is hardcoded; could be a
   simple setting instead.
-- **Configurable keyboard shortcut.** During installation and during run from tray.
 - **Configurable autostart.** During installation and during run from tray.
 - **`.deb` packaging.** AppImage works today; a `.deb` target would suit
   Debian/Ubuntu users who prefer `apt`/`dpkg` over a standalone binary.

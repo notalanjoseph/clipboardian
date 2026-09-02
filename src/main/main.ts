@@ -40,22 +40,28 @@ if (!gotLock) {
 
     tray = new Tray(path.join(__dirname, '..', 'renderer', 'tray-icon.png'));
     tray.setToolTip('Clipboardian');
-    tray.setContextMenu(
-      Menu.buildFromTemplate([
-        { label: 'Clipboardian', enabled: false },
-        { type: 'separator' },
+
+    const buildTrayMenu = (binding: string | null) => {
+      return Menu.buildFromTemplate([
+        { label: "CLIPBOARDIAN", enabled: false },
+        { label: `Hotkey: ${binding ?? "not set"}`, enabled: false },
         {
-          label: 'Uninstall...',
+          label: "Change Hotkey...",
+          click: () => appImageSetup.openHotkeySettings(),
+        },
+        { type: "separator" },
+        {
+          label: "Uninstall...",
           click: async () => {
             const result = await dialog.showMessageBox({
-              type: 'warning',
-              buttons: ['Cancel', 'Uninstall'],
+              type: "warning",
+              buttons: ["Cancel", "Uninstall"],
               defaultId: 0,
               cancelId: 0,
-              message: 'Uninstall Clipboardian?',
+              message: "Uninstall Clipboardian?",
               detail:
-                'Removes the keyboard shortcut and disables autostart. Clipboardian will quit.\nAppImage (or code files) can be manually deleted.',
-              checkboxLabel: 'Also delete clipboard history',
+                "Removes the keyboard shortcut and disables autostart. Clipboardian will quit.\nAppImage (or code files) can be manually deleted.",
+              checkboxLabel: "Also delete clipboard history",
               checkboxChecked: false,
             });
             if (result.response !== 1) return;
@@ -67,20 +73,20 @@ if (!gotLock) {
             app.quit();
           },
         },
-        { type: 'separator' },
+        { type: "separator" },
         {
-          label: 'Quit',
+          label: "Quit",
           click: async () => {
             const result = await dialog.showMessageBox({
-              type: 'question',
-              buttons: ['Cancel', 'Quit'],
+              type: "question",
+              buttons: ["Cancel", "Quit"],
               defaultId: 1,
               cancelId: 0,
-              message: 'Quit Clipboardian?',
+              message: "Quit Clipboardian?",
               detail:
                 "Clipboard copies won't be recorded while it's not running.\n" +
-                'Pressing the hotkey again to relaunch Clipboardian.',
-              checkboxLabel: 'Also delete clipboard history',
+                "Press the hotkey to relaunch Clipboardian.",
+              checkboxLabel: "Also delete clipboard history",
               checkboxChecked: false,
             });
             if (result.response !== 1) return;
@@ -91,19 +97,58 @@ if (!gotLock) {
             app.quit();
           },
         },
-      ]),
-    );
+      ]);
+    };
 
-    if (process.argv.includes(TOGGLE_ARG)) {
+    let lastKnownBinding = appImageSetup.currentBindingLabel();
+    tray.setContextMenu(buildTrayMenu(lastKnownBinding));
+
+    // Poll for hotkey changes made via GNOME Settings rather than relying on
+    // Electron's Tray 'click' event — confirmed by real-world testing (not
+    // assumption) that GNOME's tray protocol shows the previously-set menu
+    // directly, without giving Electron a reliable hook to rebuild it first.
+    // 3s is frequent enough to feel live for a rare, manual action (rebinding
+    // a hotkey) without meaningful overhead — only rebuilds the menu when the
+    // binding actually changed, not on every tick.
+    setInterval(() => {
+      if (!tray) return;
+      const binding = appImageSetup.currentBindingLabel();
+      if (binding !== lastKnownBinding) {
+        lastKnownBinding = binding;
+        tray.setContextMenu(buildTrayMenu(binding));
+      }
+    }, 3000);
+
+    const isHotkeyToggle = process.argv.includes(TOGGLE_ARG);
+    if (isHotkeyToggle) {
       popupWindow.toggle();
-    } else if (alreadyConfigured) {
-      // Plain double-click that relaunched the (previously quit) app.
+    }
+
+    // Best-effort housekeeping. No-op unless running as a packaged AppImage.
+    // Popup toggling above already happened, unblocked, so moving this
+    // ahead of the notifyRelaunched() decision below doesn't delay a
+    // hotkey-triggered launch — only the (non-performance-critical) decision
+    // of whether to also show a relaunch notification is affected. This
+    // ordering (not "run last" as before) is required: its return value
+    // tells us whether it already notified this run (hotkey newly bound, or
+    // newly discovered as unbindable), so a launch that both relaunches
+    // *and* resolves the hotkey doesn't show two contradictory
+    // notifications back to back — see AGENTS.md correction.
+    const notifiedByHotkeySetup = appImageSetup.ensureHotkeyAndAutostart();
+
+    if (!isHotkeyToggle && alreadyConfigured && !notifiedByHotkeySetup) {
+      // Plain double-click that relaunched the (previously quit) app, with
+      // nothing new to report about the hotkey this run.
       appImageSetup.notifyRelaunched();
     }
 
-    // Best-effort housekeeping, run last so it never delays the tray icon
-    // or the popup showing. No-op unless running as a packaged AppImage.
-    appImageSetup.ensureHotkeyAndAutostart();
+    // Rebuild the tray menu now that the hotkey may have just been decided
+    // for the first time — the initial buildTrayMenu() call above ran
+    // before ensureHotkeyAndAutostart(), so a genuinely first-ever AppImage
+    // launch would otherwise show "Hotkey: not set" even after one gets
+    // assigned moments later.
+    lastKnownBinding = appImageSetup.currentBindingLabel();
+    if (tray) tray.setContextMenu(buildTrayMenu(lastKnownBinding));
   });
 
   // Electron doesn't quit on Ctrl+C by default (nothing installs a SIGINT
