@@ -797,6 +797,15 @@ Don't re-attempt these without re-reading why they were rejected:
   error appears, and critically that the gsettings hotkey registration is
   left completely untouched (Quit must never call `uninstall()`).
 
+  **Later change: Quit's checkbox now calls `store.clearHistory()`, not
+  `wipeData()`** — found by code review after the Change View setting was
+  added to a `settings` table in the same DB file: deleting the whole file
+  on Quit silently reset that setting too, which "Also delete clipboard
+  history" doesn't promise. `clearHistory()` deletes only `entries` rows,
+  then `VACUUM` + `wal_checkpoint(TRUNCATE)` so the deleted text doesn't
+  linger in free pages or the `-wal` file. Uninstall still uses
+  `wipeData()` — a reinstall should start fully fresh, settings included.
+
   **`store.wipeData()` closes the DB before deleting its files, not
   after** — it's opened in WAL mode (`store.ts`'s `init()`), so unlinking
   `clipboardian.db` out from under a still-open connection risks
@@ -1010,3 +1019,12 @@ these are the tools that actually work here — don't re-waste time on
   clipboard; the user presses Ctrl+V themselves.
 - 500 most recent entries kept (unpinned); `pinned` column exists in the
   schema for future use but isn't exposed in the UI yet.
+- The tray's "Change View" (5/10/25/50/100, default 25, stored in the `settings` table)
+  is a **display** limit on `search()`, not the storage cap — deliberately,
+  per the user's request, so lowering it hides entries instead of deleting
+  them. The 500-entry prune is independent of it and still hardcoded.
+  Its radio items' click handler must re-call `tray.setContextMenu()` —
+  reported by the user: without it the checkmark stayed stuck on the old
+  value (the same GNOME tray limitation as the hotkey label above: the tray
+  shows the last `Menu` it was given, and Electron's own radio toggling
+  never reaches it).

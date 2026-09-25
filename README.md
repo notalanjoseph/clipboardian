@@ -75,11 +75,12 @@ pnpm start   # quits cleanly on Ctrl+C, or use the tray icon's Quit
 
 - The app runs in the background; look for its icon in the system tray.
 - Press assigned keyboard shortcut anywhere to open the history popup.
-- Type to filter, **↑/↓** to move the selection, **Enter** to pick an item.
+- Type to search upto previous 500 entries; **↑/↓** moves the selection.
+- **Enter** to pick an item; **Esc** to close the popup.
 - **Ctrl+V** normally to paste it wherever you need.
-- **Esc** or clicking away closes the popup without changing the clipboard.
-- History persists across restarts and is capped at the 500 most recent entries.
-- Tray icon → **Quit** stops it completely, nothing gets recorded.
+- **Change View** in Tray icon sets how many entries the popup shows (default 25). Lowering it only hides older entries.
+Older entries upto 500 are still searchable.
+- **Quit** in Tray icon stops Clipboardian, nothing gets recorded. Press hotkey to restart it.
 - Delete `~/.config/autostart/clipboardian.desktop` if you don't want autostart.
 
 ## Uninstalling
@@ -123,8 +124,6 @@ git push --follow-tags   # push the new tag
   the top entries, instead of always arrow-navigating + Enter.
 - **Cursor-relative popup position.** It's centered on the screen for now — positioning near the cursor would feel more
   natural for a keyboard-driven popup.
-- **Configurable history size.** The 500-entry cap is hardcoded; could be a
-  simple setting instead.
 - **Configurable autostart.** During installation and during run from tray.
 - **`.deb` packaging.** AppImage works today; a `.deb` target would suit
   Debian/Ubuntu users who prefer `apt`/`dpkg` over a standalone binary.

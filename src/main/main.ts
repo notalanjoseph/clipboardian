@@ -49,6 +49,21 @@ if (!gotLock) {
           label: "Change Hotkey...",
           click: () => appImageSetup.openHotkeySettings(),
         },
+        {
+          label: "Change View",
+          submenu: store.DISPLAY_LIMIT_OPTIONS.map((n) => ({
+            label: String(n),
+            type: "radio" as const,
+            checked: store.getDisplayLimit() === n,
+            click: () => {
+              store.setDisplayLimit(n);
+              // GNOME's tray shows the last Menu passed to setContextMenu()
+              // as-is, so Electron's own radio toggling never reaches it —
+              // re-export the menu so the checkmark follows the new value.
+              tray?.setContextMenu(buildTrayMenu(lastKnownBinding));
+            },
+          })),
+        },
         { type: "separator" },
         {
           label: "Uninstall...",
@@ -93,7 +108,7 @@ if (!gotLock) {
             quitting = true;
             clipboardWatcher.stop();
             popupWindow.destroy();
-            if (result.checkboxChecked) store.wipeData();
+            if (result.checkboxChecked) store.clearHistory();
             app.quit();
           },
         },

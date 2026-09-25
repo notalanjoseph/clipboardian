@@ -70,7 +70,7 @@ test('addEntry prunes to the 500 most recent unpinned entries', () => {
     store.addEntry(`entry-${i}`);
   }
   const all = store.search('');
-  // search() itself caps at 100, so check the underlying count via getById
+  // search() itself caps at the display limit, so check the underlying count via getById
   // across the full known id range instead of relying on search()'s LIMIT.
   let remaining = 0;
   for (let id = 1; id <= 505; id++) {
@@ -79,7 +79,7 @@ test('addEntry prunes to the 500 most recent unpinned entries', () => {
   assert.equal(remaining, 500);
   assert.equal(store.getById(1), undefined, 'oldest entry should have been pruned');
   assert.ok(store.getById(505), 'newest entry should survive');
-  assert.ok(all.length <= 100, 'search() caps results at 100');
+  assert.equal(all.length, 25, 'search() caps results at the default display limit');
 });
 
 test('search with empty query returns entries ordered by created_at desc', () => {
@@ -135,4 +135,53 @@ test('wipeData removes the db file and its WAL/SHM sidecar files from disk', () 
   for (const suffix of ['', '-wal', '-shm', '-journal']) {
     assert.equal(fs.existsSync(dbFile + suffix), false, `${dbFile}${suffix} should be gone`);
   }
+});
+
+test('display limit defaults to 25', () => {
+  assert.equal(store.getDisplayLimit(), 25);
+});
+
+test('setDisplayLimit caps search results without deleting hidden entries', () => {
+  for (let i = 0; i < 20; i++) {
+    waitForNextMs();
+    store.addEntry(`entry-${i}`);
+  }
+  store.setDisplayLimit(5);
+  assert.equal(store.getDisplayLimit(), 5);
+
+  const shown = store.search('');
+  assert.equal(shown.length, 5);
+  assert.equal(shown[0].text, 'entry-19', 'newest entries are the ones shown');
+  assert.equal(store.search('entry').length, 5, 'limit applies to filtered search too');
+
+  for (let id = 1; id <= 20; id++) {
+    assert.ok(store.getById(id), `entry ${id} should still be stored`);
+  }
+
+  store.setDisplayLimit(50);
+  assert.equal(store.search('').length, 20, 'raising the limit brings hidden entries back');
+});
+
+test('setDisplayLimit ignores values outside the allowed options', () => {
+  store.setDisplayLimit(10);
+  store.setDisplayLimit(7);
+  assert.equal(store.getDisplayLimit(), 10);
+});
+
+test('display limit persists across reopening the database', () => {
+  const file = path.join(tmpDir, `persist-${Date.now()}.db`);
+  store.close();
+  store.init(file);
+  store.setDisplayLimit(50);
+  store.close();
+  store.init(file);
+  assert.equal(store.getDisplayLimit(), 50);
+});
+
+test('clearHistory deletes entries but keeps the display limit setting', () => {
+  store.addEntry('secret');
+  store.setDisplayLimit(100);
+  store.clearHistory();
+  assert.equal(store.search('').length, 0);
+  assert.equal(store.getDisplayLimit(), 100);
 });

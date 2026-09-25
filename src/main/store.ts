@@ -12,6 +12,12 @@ export interface Entry {
 
 const MAX_UNPINNED_ENTRIES = 500;
 
+// How many entries the popup shows. Only limits what's displayed — stored
+// history is still pruned at MAX_UNPINNED_ENTRIES, so lowering this hides
+// older entries rather than deleting them.
+export const DISPLAY_LIMIT_OPTIONS = [5, 10, 25, 50, 100] as const;
+const DEFAULT_DISPLAY_LIMIT = 25;
+
 let db: Database.Database;
 let dbFile: string;
 
@@ -27,6 +33,10 @@ export function init(overridePath?: string): void {
       pinned INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS idx_entries_created_at ON entries(created_at DESC);
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
   `);
 }
 
@@ -51,18 +61,32 @@ export function addEntry(text: string): void {
   }
 }
 
+export function getDisplayLimit(): number {
+  const row = db.prepare("SELECT value FROM settings WHERE key = 'displayLimit'").get() as
+    | { value: string }
+    | undefined;
+  const n = Number(row?.value);
+  return (DISPLAY_LIMIT_OPTIONS as readonly number[]).includes(n) ? n : DEFAULT_DISPLAY_LIMIT;
+}
+
+export function setDisplayLimit(n: number): void {
+  if (!(DISPLAY_LIMIT_OPTIONS as readonly number[]).includes(n)) return;
+  db.prepare(
+    "INSERT INTO settings (key, value) VALUES ('displayLimit', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+  ).run(String(n));
+}
+
 export function search(query: string): Entry[] {
   const q = query.trim();
+  const limit = getDisplayLimit();
   if (!q) {
     return db
-      .prepare('SELECT * FROM entries ORDER BY created_at DESC LIMIT 100')
-      .all() as Entry[];
+      .prepare('SELECT * FROM entries ORDER BY created_at DESC LIMIT ?')
+      .all(limit) as Entry[];
   }
   return db
-    .prepare(
-      'SELECT * FROM entries WHERE text LIKE ? ORDER BY created_at DESC LIMIT 100',
-    )
-    .all(`%${q}%`) as Entry[];
+    .prepare('SELECT * FROM entries WHERE text LIKE ? ORDER BY created_at DESC LIMIT ?')
+    .all(`%${q}%`, limit) as Entry[];
 }
 
 export function touch(id: number): void {
@@ -79,6 +103,16 @@ export function close(): void {
   } catch {
     // best-effort
   }
+}
+
+// Deletes history but keeps settings — for Quit's "also delete clipboard
+// history", where the user is keeping the app. Uninstall uses wipeData()
+// instead, since a reinstall should start fully fresh. VACUUM + a WAL
+// truncate so deleted text doesn't linger in free pages or the -wal file.
+export function clearHistory(): void {
+  db.exec('DELETE FROM entries');
+  db.exec('VACUUM');
+  db.pragma('wal_checkpoint(TRUNCATE)');
 }
 
 export function wipeData(): void {
