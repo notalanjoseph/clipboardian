@@ -105,26 +105,9 @@ git push --follow-tags   # push the new tag
 
 ## Future improvements
 
-- **Auto-paste on selection.** Right now picking an item just puts it on the
-  clipboard and you press Ctrl+V yourself. True auto-paste needs `ydotool` plus a root-privileged `uinput` daemon on Wayland.
-- **Image support.** History is text-only for now; storing/thumbnailing
-  copied images would need schema changes (blob storage or on-disk files)
-  and a different popup UI.
 - **Broader Linux support.** Built and tested specifically against GNOME on
   Wayland (Ubuntu 24.04). Other desktop environments (KDE, XFCE, Sway) and
   X11 sessions would need their own hotkey-registration path and possibly a different clipboard watch mechanism.
-- **Pinned entries.** Exposing a pin/star action in the popup would
-  let favorites survive the 500-entry prune instead of aging out.
-- **Delete individual entries / clear history.** There's currently no way to
-  remove a single item — only age-based pruning
-  does that.
-- **Sensitive-content exclusion.** Nothing currently stops a password copied
-  from a password manager from landing in plaintext history.
-- **Quicker selection.** Number-key shortcuts (1–9) to instantly pick one of
-  the top entries, instead of always arrow-navigating + Enter.
-- **Cursor-relative popup position.** It's centered on the screen for now — positioning near the cursor would feel more
-  natural for a keyboard-driven popup.
-- **Configurable autostart.** During installation and during run from tray.
 - **`.deb` packaging.** AppImage works today; a `.deb` target would suit
   Debian/Ubuntu users who prefer `apt`/`dpkg` over a standalone binary.
 - **Broader automated tests.** `pnpm test` covers `store.ts`'s
@@ -132,6 +115,20 @@ git push --follow-tags   # push the new tag
   logic with no Electron/GUI dependency). The
   Electron main-process wiring, renderer, and real GUI interaction still
   have no automated coverage.
+- **Auto-paste on selection.** Right now picking an item just puts it on the
+  clipboard and you press Ctrl+V yourself. True auto-paste needs `ydotool` plus a root-privileged `uinput` daemon on Wayland.
+- **Image support.** History is text-only for now; storing/thumbnailing
+  copied images would need schema changes (blob storage or on-disk files)
+  and a different popup UI.
+- **Pinned entries.** Exposing a pin/star action in the popup would
+  let favorites survive the 500-entry prune instead of aging out.
+- **Delete individual entries / clear history.** There's currently no way to
+  remove a single item — only age-based pruning does that.
+- **Sensitive-content exclusion.** Nothing currently stops a password copied
+  from a password manager from landing in plaintext history.
+- **Cursor-relative popup position.** It's centered on the screen for now — positioning near the cursor would feel more
+  natural for a keyboard-driven popup.
+- **Configurable autostart.** During installation and during run from tray.
 
 ## License
 

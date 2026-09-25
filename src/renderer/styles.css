@@ -52,11 +52,34 @@ body {
   padding: 8px 10px;
   border-radius: 6px;
   cursor: pointer;
+  display: flex;
+  align-items: baseline;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+#list li .entry-text {
+  flex: 1;
+  min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  font-size: 13px;
-  line-height: 1.4;
+}
+
+/* Ubuntu (the main font) has no U+2938, so name fonts that do. */
+#list li .more-lines {
+  flex-shrink: 0;
+  margin-left: 8px;
+  opacity: 0.6;
+  font-family: "DejaVu Serif", "Noto Sans Math", FreeSerif, serif;
+}
+
+/* Unicode has no up-pointing left-side arc, so rotate ⤸ into one. */
+#list li .more-lines.above {
+  margin-left: 0;
+  margin-right: 8px;
+  display: inline-block;
+  transform: rotate(180deg);
 }
 
 #list li.selected {
@@ -68,5 +91,6 @@ body {
   color: #888;
   cursor: default;
   text-align: center;
+  justify-content: center;
   padding-top: 20px;
 }

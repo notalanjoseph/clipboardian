@@ -18,11 +18,31 @@ const searchInput = document.getElementById('search') as HTMLInputElement;
 const listEl = document.getElementById('list') as HTMLUListElement;
 
 let results: Entry[] = [];
+// The query `results` came from — not read live from the input at render
+// time, since typing can move on while a search is still in flight.
+let resultsQuery = '';
 let selectedIndex = 0;
 
-function summarize(text: string): string {
-  const collapsed = text.replace(/\s+/g, ' ').trim();
-  return collapsed.length > 200 ? collapsed.slice(0, 200) + '…' : collapsed;
+// Shows one line of the entry: the first line containing the search query
+// (so a match on line 3 isn't hidden behind an unrelated line 1), else the
+// first non-empty line. `above`/`below` say whether other non-empty lines
+// exist before/after it — blank lines don't count, so a single line copied
+// with a trailing newline (common from terminals) isn't marked. Matching is
+// case-insensitive like store.ts's SQLite LIKE.
+function summarize(
+  text: string,
+  query: string,
+): { text: string; above: boolean; below: boolean } {
+  const lines = text.split(/\r?\n/).filter((line) => line.trim());
+  const q = query.trim().toLowerCase();
+  const found = q ? lines.findIndex((line) => line.toLowerCase().includes(q)) : -1;
+  const index = found === -1 ? 0 : found;
+  const line = (lines[index] ?? '').replace(/\s+/g, ' ').trim();
+  return {
+    text: line.length > 200 ? line.slice(0, 200) + '…' : line,
+    above: index > 0,
+    below: index < lines.length - 1,
+  };
 }
 
 function render(): void {
@@ -36,7 +56,25 @@ function render(): void {
   }
   results.forEach((entry, i) => {
     const li = document.createElement('li');
-    li.textContent = summarize(entry.text);
+    const summary = summarize(entry.text, resultsQuery);
+    if (summary.above) {
+      const above = document.createElement('span');
+      above.className = 'more-lines above';
+      above.title = 'More lines above';
+      above.textContent = '⤸';
+      li.appendChild(above);
+    }
+    const textEl = document.createElement('span');
+    textEl.className = 'entry-text';
+    textEl.textContent = summary.text;
+    li.appendChild(textEl);
+    if (summary.below) {
+      const more = document.createElement('span');
+      more.className = 'more-lines';
+      more.title = 'More lines below';
+      more.textContent = '⤸';
+      li.appendChild(more);
+    }
     if (i === selectedIndex) li.classList.add('selected');
     li.addEventListener('mouseenter', () => highlight(i));
     li.addEventListener('mousedown', (e) => {
@@ -57,7 +95,9 @@ function highlight(index: number): void {
 }
 
 async function refresh(): Promise<void> {
-  results = await api.search(searchInput.value);
+  const query = searchInput.value;
+  results = await api.search(query);
+  resultsQuery = query;
   selectedIndex = 0;
   render();
 }
