@@ -23,25 +23,61 @@ let results: Entry[] = [];
 let resultsQuery = '';
 let selectedIndex = 0;
 
+// Chars (~60 fit in the popup's width) the match must end within to be shown
+// from the line's start; past that, the line is shown from MATCH_LEAD_CHARS
+// before the match with a leading '…'. Char-based rather than measured, since
+// the popup is pre-warmed hidden and layout isn't dependable then.
+const MATCH_VISIBLE_CHARS = 45;
+const MATCH_LEAD_CHARS = 20;
+const MAX_SHOWN_CHARS = 200;
+
 // Shows one line of the entry: the first line containing the search query
 // (so a match on line 3 isn't hidden behind an unrelated line 1), else the
-// first non-empty line. `above`/`below` say whether other non-empty lines
-// exist before/after it — blank lines don't count, so a single line copied
-// with a trailing newline (common from terminals) isn't marked. Matching is
-// case-insensitive like store.ts's SQLite LIKE.
+// first non-empty line, split around the match for highlighting.
+// `above`/`below` say whether other non-empty lines exist before/after it —
+// blank lines don't count, so a single line copied with a trailing newline
+// (common from terminals) isn't marked. Matching is case-insensitive like
+// store.ts's SQLite LIKE.
 function summarize(
   text: string,
   query: string,
-): { text: string; above: boolean; below: boolean } {
+): { before: string; match: string; after: string; above: boolean; below: boolean } {
   const lines = text.split(/\r?\n/).filter((line) => line.trim());
   const q = query.trim().toLowerCase();
   const found = q ? lines.findIndex((line) => line.toLowerCase().includes(q)) : -1;
   const index = found === -1 ? 0 : found;
   const line = (lines[index] ?? '').replace(/\s+/g, ' ').trim();
+  const above = index > 0;
+  const below = index < lines.length - 1;
+
+  // Searched in the collapsed line (what's displayed) so offsets line up; can
+  // only miss here if the query itself contains runs of whitespace. A
+  // case-insensitive regex rather than toLowerCase().indexOf(), since
+  // lowercasing can change string length (e.g. 'İ') and shift the offsets.
+  const escaped = query.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const hit = q ? new RegExp(escaped, 'iu').exec(line) : null;
+  const at = hit ? hit.index : -1;
+  let from = 0;
+  if (hit && at + hit[0].length > MATCH_VISIBLE_CHARS) {
+    from = Math.max(0, at - MATCH_LEAD_CHARS);
+    const space = line.indexOf(' ', from);
+    if (space !== -1 && space < at) from = space + 1;
+  }
+  const prefix = from > 0 ? '…' : '';
+  const matchEnd = hit ? at + hit[0].length : from;
+  const cut = Math.max(from + MAX_SHOWN_CHARS, matchEnd);
+  const suffix = line.length > cut ? '…' : '';
+  const shown = line.slice(0, cut);
+
+  if (at === -1) {
+    return { before: prefix + shown.slice(from) + suffix, match: '', after: '', above, below };
+  }
   return {
-    text: line.length > 200 ? line.slice(0, 200) + '…' : line,
-    above: index > 0,
-    below: index < lines.length - 1,
+    before: prefix + shown.slice(from, at),
+    match: shown.slice(at, matchEnd),
+    after: shown.slice(matchEnd) + suffix,
+    above,
+    below,
   };
 }
 
@@ -66,7 +102,14 @@ function render(): void {
     }
     const textEl = document.createElement('span');
     textEl.className = 'entry-text';
-    textEl.textContent = summary.text;
+    // Text nodes + textContent only: entry text is untrusted clipboard content.
+    textEl.append(summary.before);
+    if (summary.match) {
+      const mark = document.createElement('mark');
+      mark.textContent = summary.match;
+      textEl.append(mark);
+    }
+    textEl.append(summary.after);
     li.appendChild(textEl);
     if (summary.below) {
       const more = document.createElement('span');

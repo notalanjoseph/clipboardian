@@ -66,6 +66,13 @@ body {
   text-overflow: ellipsis;
 }
 
+/* Translucent + inherited color so it reads on both normal and selected rows. */
+#list li mark {
+  background: rgba(255, 200, 0, 0.35);
+  color: inherit;
+  border-radius: 2px;
+}
+
 /* Ubuntu (the main font) has no U+2938, so name fonts that do. */
 #list li .more-lines {
   flex-shrink: 0;
