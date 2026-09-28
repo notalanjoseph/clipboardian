@@ -9,88 +9,89 @@ copies) — not the mouse-select/middle-click `PRIMARY` selection.
 
 ## Setup
 
-**Super+V** will be setup as the keyboard shortcut for Clipboardian (or **Super+Shift+V**, if Super+V is taken).
+**Super+V** will be setup as the keyboard shortcut for Clipboardian
+(or **Super+Shift+V**, if Super+V is taken).
 You can check if either is free in GNOME Settings → Keyboard → View and Customize Shortcuts.
 
-Two ways to setup Clipboardian — pick one.
+### Using AppImage
 
-### Option 1: Using AppImage
+1. **Prerequisite: FUSE** — lets an AppImage self-mount and run.
+   One-time, system-wide install:
 
-**Prerequisite: FUSE** — lets an AppImage self-mount and run at all.
-One-time, system-wide install:
+   ```bash
+   sudo apt install libfuse2   # most Ubuntu versions
+   ```
 
-```bash
-sudo apt install libfuse2   # most Ubuntu versions
-```
+2. Download the latest `Clipboardian-<version>.AppImage` from the [Releases page](../../releases).
 
-Download the latest `.AppImage` from the [Releases page](../../releases).
+3. Double-click the AppImage or run it from a terminal:
 
-Double-click the AppImage or run it from a terminal:
+   ```bash
+   ./Clipboardian-<version>.AppImage
+   ```
 
-```bash
-./Clipboardian-<version>.AppImage
-```
-
-<details>
-<summary>Troubleshooting: can't install libfuse2</summary>
+<details> <summary>Unable to install libfuse2?</summary>
 After downloading the AppImage, run:
 
 ```bash
 ./Clipboardian-<version>.AppImage --appimage-extract-and-run
 ```
-
 </details>
 
-<details>
-<summary>Building the AppImage yourself instead of downloading it</summary>
+<details> <summary>Want to build the AppImage instead of downloading it?</summary>
 
 ```bash
 git clone https://github.com/notalanjoseph/clipboardian.git
 cd clipboardian
+pnpm install
 pnpm run dist   # produces dist/Clipboardian-<version>.AppImage
 ```
-
 </details>
 
-### Option 2: Using source code
+<details> <summary>Previously installed from source with <code>setup.sh</code>?</summary>
 
-```bash
-git clone https://github.com/notalanjoseph/clipboardian.git
-cd clipboardian
-```
-
-```bash
-chmod +x ./setup.sh
-./setup.sh
-```
-
-The setup script installs deps, builds, registers the hotkey, sets up autostart.
-Autostart won't kick in until your next login, so to try it immediately:
-
-```bash
-pnpm start   # quits cleanly on Ctrl+C, or use the tray icon's Quit
-```
+`setup.sh` has been removed; the AppImage is now the only install method.
+Quit the running Clipboardian from the tray (so the AppImage isn't blocked by
+it), then run the AppImage — it takes over the existing hotkey (keeping your
+binding) and autostart entry automatically, and adds the cursor-position
+GNOME Shell extension (log out and back in once for that).
+</details>
 
 ## Usage
 
+- After setup, **log out and back in once** for full Clipboardian features.
 - The app runs in the background; look for its icon in the system tray.
 - Press assigned keyboard shortcut anywhere to open the history popup.
 - Type to search upto previous 500 entries; **↑/↓** moves the selection.
 - **Enter** to pick an item; **Esc** to close the popup.
 - **Ctrl+V** normally to paste it wherever you need.
-- **Change View** in Tray icon sets how many entries the popup shows (default 25). Lowering it only hides older entries.
-Older entries upto 500 are still searchable.
+- **Change View** in Tray icon sets how many entries the popup shows (default 25).
+Lowering it only hides older entries. Older entries upto 500 are still searchable.
 - **Quit** in Tray icon stops Clipboardian, nothing gets recorded. Press hotkey to restart it.
 - Delete `~/.config/autostart/clipboardian.desktop` if you don't want autostart.
+- Popup stopped opening at the mouse cursor after a GNOME upgrade? Check the
+[Releases page](../../releases) for a newer Clipboardian that supports it.
 
 ## Uninstalling
 
-Tray icon → **"Uninstall..."** removes the global hotkey and the
-autostart entry, then quits.
+Tray icon → **"Uninstall..."** removes the global hotkey, the
+autostart entry and the GNOME Shell extension, then quits.
 
-The one thing it doesn't
-do is delete the app itself. Remove the cloned repo, or the `.AppImage`
-file, whenever you're done.
+The one thing it doesn't do is delete the app itself.
+Delete the `.AppImage` whenever you're done.
+
+## Development
+
+```bash
+pnpm install
+pnpm start      # build + run from source; Ctrl+C or the tray's Quit to stop
+pnpm test       # store.ts unit tests
+pnpm run dist   # build the AppImage, to test the installed flow end to end
+```
+
+`pnpm start` doesn't register the hotkey, autostart or GNOME Shell extension —
+that only happens when running as an AppImage. To open the popup of a
+`pnpm start` instance, run `./node_modules/.bin/electron --no-sandbox . --toggle-popup`.
 
 ## Releasing
 
@@ -126,8 +127,6 @@ git push --follow-tags   # push the new tag
   remove a single item — only age-based pruning does that.
 - **Sensitive-content exclusion.** Nothing currently stops a password copied
   from a password manager from landing in plaintext history.
-- **Cursor-relative popup position.** It's centered on the screen for now — positioning near the cursor would feel more
-  natural for a keyboard-driven popup.
 - **Configurable autostart.** During installation and during run from tray.
 
 ## License

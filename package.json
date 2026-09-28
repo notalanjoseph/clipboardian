@@ -16,7 +16,7 @@
   },
   "main": "build/main/main.js",
   "scripts": {
-    "build": "tsc -p tsconfig.json && mkdir -p build/renderer && cp src/renderer/index.html src/renderer/styles.css src/renderer/tray-icon.png build/renderer/",
+    "build": "tsc -p tsconfig.json && mkdir -p build/renderer && cp src/renderer/index.html src/renderer/styles.css src/renderer/tray-icon.png build/renderer/ && cp -r gnome-extension build/",
     "postinstall": "electron-rebuild -f -w better-sqlite3",
     "start": "pnpm run build && electron --no-sandbox .",
     "test": "pnpm run build && ELECTRON_RUN_AS_NODE=1 electron --test build",

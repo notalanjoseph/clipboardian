@@ -14,6 +14,20 @@ const CUSTOM_SCHEMA = `${BASE}.custom-keybinding:${SLOT_PATH}`;
 
 const AUTOSTART_FILE = path.join(os.homedir(), '.config', 'autostart', 'clipboardian.desktop');
 
+// GNOME Shell extension that exposes the real pointer position over D-Bus
+// (see gnome-extension/ and popupWindow.ts's pointerFromShell()). Bundled
+// into build/ by the build script, so it's inside the AppImage's app.asar.
+const EXTENSION_UUID = 'clipboardian@notalanjoseph.github.io';
+const EXTENSION_DIR = path.join(
+  os.homedir(), '.local', 'share', 'gnome-shell', 'extensions', EXTENSION_UUID,
+);
+const EXTENSION_FILES = ['metadata.json', 'extension.js'];
+const SHELL_SCHEMA = 'org.gnome.shell';
+
+function bundledExtensionDir(): string {
+  return path.join(__dirname, '..', 'gnome-extension', EXTENSION_UUID);
+}
+
 function autostartMarkerFile(): string {
   return path.join(app.getPath('userData'), '.autostart-managed');
 }
@@ -32,6 +46,12 @@ function hotkeyMarkerFile(): string {
 // genuinely first-ever launch even though the hotkey itself stayed unbound.
 function noFreeHotkeyNotifiedMarkerFile(): string {
   return path.join(app.getPath('userData'), '.no-free-hotkey-notified');
+}
+
+// Same shape as autostartMarkerFile(): distinguishes "never installed"
+// (install it) from "user removed the extension on purpose" (leave it gone).
+function extensionMarkerFile(): string {
+  return path.join(app.getPath('userData'), '.extension-managed');
 }
 
 function log(message: string): void {
@@ -70,18 +90,34 @@ function showNotification(title: string, body: string): void {
 // so this is the only way a first-time user learns what hotkey got picked
 // (this matters especially for the Super+Shift+V fallback case, which they
 // wouldn't otherwise know to try).
-function notifyHotkeyBound(binding: string): void {
+const LOGIN_HINT = '. Re-login to activate all features.';
+
+function notifyHotkeyBound(binding: string, extensionJustInstalled: boolean): void {
   showNotification(
     "Clipboardian installed",
-    `To open clipboard history press ${humanizeBinding(binding)}`,
+    `To open clipboard history press ${humanizeBinding(binding)}` +
+      (extensionJustInstalled ? LOGIN_HINT : ''),
   );
 }
 
-function notifyNoFreeHotkey(): void {
+
+// When no hotkey notification fired this run to carry LOGIN_HINT: an existing
+// install updating to a version that ships the extension, a hotkey the user
+// already bound, or a retry after a failed enable. Neutral title, since it
+// can also be a first-ever launch whose hotkey setup failed.
+function notifyExtensionInstalled(): void {
+  showNotification(
+    'Clipboardian',
+    'Re-login to activate all features.',
+  );
+}
+
+function notifyNoFreeHotkey(extensionJustInstalled: boolean): void {
   showNotification(
     'Clipboardian installed | Action required',
     'Could not find a free hotkey. Bind one manually in ' +
-      'GNOME Settings → Keyboard → Keyboard Shortcuts → Custom Shortcuts → "Clipboardian".',
+      'GNOME Settings → Keyboard → Keyboard Shortcuts → Custom Shortcuts → "Clipboardian"' +
+      (extensionJustInstalled ? LOGIN_HINT : '.'),
   );
 }
 
@@ -104,9 +140,9 @@ function gset(schema: string, key: string, value: string): boolean {
   }
 }
 
-// Runs a python3 script via stdin (argv-identical to setup.sh's
-// `python3 - "$1" "$2" <<'PY'`), so scripts ported from setup.sh work
-// unmodified. Convention: exit 0 = the condition the script checks for is
+// Runs a python3 script via stdin (`python3 - arg1 arg2`; the scripts were
+// originally bash heredocs in the since-removed setup.sh). Convention:
+// exit 0 = the condition the script checks for is
 // true (stdout carries any accompanying data); exit non-zero = false.
 function pyRun(script: string, args: string[]): { ok: boolean; stdout: string } {
   try {
@@ -118,9 +154,9 @@ function pyRun(script: string, args: string[]): { ok: boolean; stdout: string } 
   }
 }
 
-// Ported verbatim from setup.sh's find_binding_conflict(): same schema
-// enumeration, same custom-keybinding-array walk, same ast.literal_eval
-// matching. Exit 0 + no output = binding free; exit 1 + holder description
+// Checks every fixed-path keybinding/media-keys schema plus every custom
+// keybinding slot (see AGENTS.md for why each is needed), comparing
+// normalized accelerators via ast.literal_eval. Exit 0 + no output = binding free; exit 1 + holder description
 // on stdout = already taken.
 const PY_FIND_CONFLICT = `
 import ast
@@ -222,6 +258,9 @@ import ast
 import sys
 
 raw, item = sys.argv[1], sys.argv[2]
+# gsettings prints an empty string array as '@as []'.
+if raw.startswith('@as '):
+    raw = raw[4:]
 try:
     arr = ast.literal_eval(raw)
 except (ValueError, SyntaxError):
@@ -229,13 +268,15 @@ except (ValueError, SyntaxError):
 sys.exit(0 if item in arr else 1)
 `;
 
-// Prints the array with item appended (if not already present). Ported
-// verbatim from setup.sh's array-ensure heredoc.
+// Prints the array with item appended (if not already present).
 const PY_ARRAY_APPEND = `
 import ast
 import sys
 
 current, item = sys.argv[1], sys.argv[2]
+# gsettings prints an empty string array as '@as []'.
+if current.startswith('@as '):
+    current = current[4:]
 arr = ast.literal_eval(current)
 if item not in arr:
     arr.append(item)
@@ -248,6 +289,9 @@ import ast
 import sys
 
 current, item = sys.argv[1], sys.argv[2]
+# gsettings prints an empty string array as '@as []'.
+if current.startswith('@as '):
+    current = current[4:]
 arr = ast.literal_eval(current)
 if item in arr:
     arr.remove(item)
@@ -307,9 +351,9 @@ function unquoteGVariantString(raw: string): string {
 // Reads whatever the hotkey binding *currently* is — the default we picked,
 // or something the user rebound manually via GNOME Settings — for display
 // in launch notifications and the tray menu. Returns null if unset/unreadable.
-// Not gated on process.env.APPIMAGE: setup.sh (dev mode) and this file's own
-// first-run setup both write into the same gsettings slot, so a plain read
-// works correctly regardless of which one configured it.
+// Not gated on process.env.APPIMAGE: a dev-mode instance shows the tray
+// label too, reading whatever this file's AppImage setup (or an old
+// setup.sh install) wrote into the slot.
 export function currentBindingLabel(): string | null {
   const raw = gget(CUSTOM_SCHEMA, 'binding');
   if (!raw.ok) return null;
@@ -380,8 +424,8 @@ function wrapperScriptFile(): string {
 // `unshare -Ur true` heuristic that decides whether to add --no-sandbox,
 // so a direct exec hit the exact FATAL chrome-sandbox crash this project
 // already ruled out elsewhere ("Electron runs with --no-sandbox") for
-// every other invocation path (pnpm start, setup.sh's hotkey command, the
-// autostart entry) — all of which hardcode the flag unconditionally rather
+// every other invocation path (pnpm start and, historically, setup.sh's
+// hotkey command and autostart entry) — all of which hardcode the flag unconditionally rather
 // than relying on a per-invocation heuristic, because this project already
 // decided the real sandbox doesn't work here and deliberately avoids the
 // sudo chown/chmod fix. The fallback branch is left alone (still goes
@@ -411,7 +455,7 @@ function ensureFastToggleWrapper(appimagePath: string): string {
 // notifyRelaunched() in the same launch, which would otherwise show two
 // contradictory notifications back to back on a launch where a previously
 // unresolvable hotkey becomes bindable (see AGENTS.md correction).
-function ensureHotkey(appimagePath: string): boolean {
+function ensureHotkey(appimagePath: string, extensionJustInstalled: boolean): boolean {
   const expectedCommand = ensureFastToggleWrapper(appimagePath);
 
   const arrResult = gget(BASE, 'custom-keybindings');
@@ -452,7 +496,6 @@ function ensureHotkey(appimagePath: string): boolean {
   // than removing the slot" (must not reassign). Both look identical at
   // the gsettings level, so a marker file is the only way to tell them
   // apart — this runs automatically on every login with no user action,
-  // unlike setup.sh which only runs when a user deliberately invokes it,
   // so we must never clobber a user's own choice.
   const marker = hotkeyMarkerFile();
   const everManaged = fs.existsSync(marker);
@@ -483,7 +526,7 @@ function ensureHotkey(appimagePath: string): boolean {
         fs.mkdirSync(path.dirname(marker), { recursive: true });
         fs.writeFileSync(marker, '');
         log(`hotkey bound to ${binding}`);
-        notifyHotkeyBound(binding);
+        notifyHotkeyBound(binding, extensionJustInstalled);
         return true;
       }
     } else {
@@ -499,7 +542,7 @@ function ensureHotkey(appimagePath: string): boolean {
       if (!fs.existsSync(noFreeHotkeyMarker)) {
         fs.mkdirSync(path.dirname(noFreeHotkeyMarker), { recursive: true });
         fs.writeFileSync(noFreeHotkeyMarker, '');
-        notifyNoFreeHotkey();
+        notifyNoFreeHotkey(extensionJustInstalled);
         // Only pop open Settings when the user actually needs to act —
         // a successful auto-bind above needs no follow-up, but this message
         // already tells them to bind one manually, so opening it directly
@@ -545,12 +588,166 @@ function ensureAutostart(appimagePath: string): void {
     return;
   }
 
+  // Existing file this code didn't create (e.g. left by the since-removed
+  // setup.sh): adopt it, so a later deliberate deletion sticks instead of
+  // looking like a first install and getting recreated.
+  if (!everManaged) writeMarker(marker);
+
   const content = fs.readFileSync(AUTOSTART_FILE, 'utf8');
   const execLine = content.split('\n').find((l) => l.startsWith('Exec='));
   if (execLine !== expectedExecLine) {
     writeAutostartFile(appimagePath);
     log(`updated stale autostart entry exec path: ${AUTOSTART_FILE}`);
   }
+}
+
+// Major version of the running GNOME Shell (e.g. 46), or null if it can't be
+// read. From the shell's own D-Bus property (~10ms) rather than spawning
+// `gnome-shell --version`, and it's the running shell that matters.
+function runningShellMajor(): number | null {
+  try {
+    const out = execFileSync(
+      'gdbus',
+      [
+        'call', '--session', '--dest', 'org.gnome.Shell', '--object-path', '/org/gnome/Shell',
+        '--method', 'org.freedesktop.DBus.Properties.Get', 'org.gnome.Shell', 'ShellVersion',
+      ],
+      { encoding: 'utf8', timeout: 1000, stdio: ['ignore', 'pipe', 'ignore'] },
+    );
+    const m = /'(\d+)[.']/.exec(out);
+    return m ? Number(m[1]) : null;
+  } catch {
+    return null;
+  }
+}
+
+// GNOME Shell refuses to load an extension whose metadata.json doesn't list
+// the running major version (and extension.js's ES-module format needs 45+
+// anyway), so installing it there would only produce a "re-login" hint that
+// can't come true. Read from the bundled metadata.json so the supported range
+// lives in one place. Unknown version → assume supported, as before.
+function shellSupportsExtension(): boolean {
+  const major = runningShellMajor();
+  if (major === null) return true;
+  try {
+    const metadata = JSON.parse(
+      fs.readFileSync(path.join(bundledExtensionDir(), 'metadata.json'), 'utf8'),
+    ) as { 'shell-version'?: string[] };
+    return (metadata['shell-version'] ?? []).includes(String(major));
+  } catch {
+    return true;
+  }
+}
+
+function writeExtensionFiles(): void {
+  fs.mkdirSync(EXTENSION_DIR, { recursive: true });
+  for (const file of EXTENSION_FILES) {
+    // readFileSync, not copyFileSync: the source is inside app.asar.
+    fs.writeFileSync(
+      path.join(EXTENSION_DIR, file),
+      fs.readFileSync(path.join(bundledExtensionDir(), file)),
+    );
+  }
+}
+
+// Returns whether the extension was newly installed this run. GNOME Shell on
+// Wayland only discovers new extensions at login, so it can't take effect
+// before then — the caller tells the user. An existing install's files are
+// refreshed when they differ from the bundled ones (app update); also only
+// picked up at next login, which is fine for a silent upgrade.
+// Adds the extension to enabled-extensions if it isn't there yet. Only ever
+// called before the marker exists, like the hotkey binding: once managed, a
+// user disabling it in the Extensions app sticks.
+// Removes item from a gsettings string-array key if present; true if it's
+// absent afterwards.
+function removeFromArray(schema: string, key: string, item: string): boolean {
+  const current = gget(schema, key);
+  if (!current.ok) return false;
+  if (!pyRun(PY_ARRAY_CONTAINS, [current.raw, item]).ok) return true;
+  const removed = pyRun(PY_ARRAY_REMOVE, [current.raw, item]);
+  return removed.ok && gset(schema, key, removed.stdout);
+}
+
+function enableExtension(): 'added' | 'already' | 'failed' {
+  // The Extensions app's toggle-off also adds the uuid to disabled-extensions,
+  // which GNOME Shell treats as overriding enabled-extensions. Only reached
+  // when the user is (re)installing — first install, after Uninstall, or a
+  // retry — never for a managed extension they switched off, so clearing it
+  // doesn't undo a choice they made about this install.
+  if (!removeFromArray(SHELL_SCHEMA, 'disabled-extensions', EXTENSION_UUID)) return 'failed';
+  const enabled = gget(SHELL_SCHEMA, 'enabled-extensions');
+  if (!enabled.ok) return 'failed';
+  if (pyRun(PY_ARRAY_CONTAINS, [enabled.raw, EXTENSION_UUID]).ok) return 'already';
+  const appended = pyRun(PY_ARRAY_APPEND, [enabled.raw, EXTENSION_UUID]);
+  return appended.ok && gset(SHELL_SCHEMA, 'enabled-extensions', appended.stdout)
+    ? 'added'
+    : 'failed';
+}
+
+function writeMarker(marker: string): void {
+  fs.mkdirSync(path.dirname(marker), { recursive: true });
+  fs.writeFileSync(marker, '');
+}
+
+// Returns whether this run made the extension newly usable after a login
+// (installed and enabled) — the caller tells the user to log in again. A
+// failed enable returns false, so no hint promises something that won't
+// happen; the next launch retries, and tells them then.
+function ensureExtension(): boolean {
+  // Checked every launch, before touching anything: no files, no marker, so
+  // a later GNOME upgrade into the supported range (or an app update that
+  // extends it) installs normally then.
+  if (!shellSupportsExtension()) {
+    log(`GNOME Shell ${runningShellMajor()} isn't supported by the bundled extension; skipping cursor placement`);
+    return false;
+  }
+  const marker = extensionMarkerFile();
+  const everManaged = fs.existsSync(marker);
+
+  const justInstalled = !fs.existsSync(EXTENSION_DIR);
+  if (justInstalled) {
+    if (everManaged) {
+      log('GNOME Shell extension was previously removed by the user; not reinstalling');
+      return false;
+    }
+    writeExtensionFiles();
+    log(`installed GNOME Shell extension: ${EXTENSION_DIR} (active after next login)`);
+  }
+
+  // Unmanaged but present: a previous launch failed to enable it, or it was
+  // just installed above. (A hand install the user then disabled would get
+  // re-enabled here once — no shipped version ever installed it any other
+  // way, so that's only a developer's machine.)
+  let newlyEnabled = false;
+  if (!everManaged) {
+    const result = enableExtension();
+    if (result === 'failed') {
+      log('could not add GNOME Shell extension to enabled-extensions; will retry next launch');
+    } else {
+      writeMarker(marker);
+      // GNOME's global "Use Extensions" switch off means no extension loads,
+      // so don't promise cursor placement after a login. Left installed and
+      // enabled, so it works if the user turns that switch back on.
+      // A boolean prints as a bare true/false — nothing to literal_eval.
+      const userExtensionsOff = gget(SHELL_SCHEMA, 'disable-user-extensions').raw === 'true';
+      if (userExtensionsOff) {
+        log('user extensions are disabled globally (disable-user-extensions); cursor placement stays off until they are re-enabled');
+      }
+      newlyEnabled = !userExtensionsOff && (justInstalled || result === 'added');
+    }
+  }
+  const stale = EXTENSION_FILES.some((file) => {
+    const target = path.join(EXTENSION_DIR, file);
+    return (
+      !fs.existsSync(target) ||
+      !fs.readFileSync(target).equals(fs.readFileSync(path.join(bundledExtensionDir(), file)))
+    );
+  });
+  if (stale) {
+    writeExtensionFiles();
+    log(`updated GNOME Shell extension files: ${EXTENSION_DIR} (active after next login)`);
+  }
+  return newlyEnabled;
 }
 
 // Whether the hotkey question has already been addressed once before (i.e.
@@ -597,8 +794,8 @@ export function notifyRelaunched(): void {
 // Only does anything when running as a packaged AppImage (APPIMAGE is set
 // by the AppImage runtime to the running .AppImage file's own absolute
 // path — confirmed present even under --appimage-extract-and-run). Dev-mode
-// `electron .`/`pnpm start` never has this set, so this is a no-op there;
-// that flow still relies on setup.sh, unchanged.
+// `electron .`/`pnpm start` never has this set, so this is a no-op there —
+// dev mode deliberately registers nothing.
 //
 // Returns whether ensureHotkey() fired a notification this run — main.ts
 // uses this to decide whether notifyRelaunched() also needs to fire, so a
@@ -608,11 +805,24 @@ export function ensureHotkeyAndAutostart(): boolean {
   const appimagePath = process.env.APPIMAGE;
   if (!appimagePath) return false;
 
+  // Before ensureHotkey(), so a first-run hotkey notification can mention it.
+  let extensionJustInstalled = false;
+  try {
+    extensionJustInstalled = ensureExtension();
+  } catch (err) {
+    log(`GNOME Shell extension setup failed: ${err}`);
+  }
+
   let notified = false;
   try {
-    notified = ensureHotkey(appimagePath);
+    notified = ensureHotkey(appimagePath, extensionJustInstalled);
   } catch (err) {
     log(`hotkey setup failed: ${err}`);
+  }
+
+  if (extensionJustInstalled && !notified) {
+    notifyExtensionInstalled();
+    notified = true;
   }
 
   try {
@@ -624,11 +834,11 @@ export function ensureHotkeyAndAutostart(): boolean {
   return notified;
 }
 
-// Reverses whatever's registered under SLOT_PATH, regardless of whether
-// setup.sh (dev mode) or ensureHotkeyAndAutostart (packaged AppImage)
-// created it — both use the same slot name/path, so one cleanup path
-// handles either. Not gated on process.env.APPIMAGE, since the tray menu
-// (and this action) exists in both dev mode and the packaged app.
+// Reverses whatever's registered under SLOT_PATH — by the AppImage's own
+// setup, or by the since-removed setup.sh (same slot name/path, so one
+// cleanup path handles either). Not gated on process.env.APPIMAGE, since the
+// tray menu (and this action) exists in dev mode too, which is how an old
+// setup.sh install can still be cleaned up.
 export function uninstall(): void {
   try {
     const arrResult = gget(BASE, 'custom-keybindings');
@@ -656,10 +866,25 @@ export function uninstall(): void {
   }
 
   try {
+    // Removing it from enabled-extensions disables it in the running shell
+    // right away; the files are only read at login. disabled-extensions too,
+    // so a reinstall starts clean.
+    removeFromArray(SHELL_SCHEMA, 'enabled-extensions', EXTENSION_UUID);
+    removeFromArray(SHELL_SCHEMA, 'disabled-extensions', EXTENSION_UUID);
+    if (fs.existsSync(EXTENSION_DIR)) {
+      fs.rmSync(EXTENSION_DIR, { recursive: true, force: true });
+      log(`removed GNOME Shell extension: ${EXTENSION_DIR}`);
+    }
+  } catch (err) {
+    log(`GNOME Shell extension removal failed: ${err}`);
+  }
+
+  try {
     for (const marker of [
       hotkeyMarkerFile(),
       autostartMarkerFile(),
       noFreeHotkeyNotifiedMarkerFile(),
+      extensionMarkerFile(),
     ]) {
       if (fs.existsSync(marker)) fs.unlinkSync(marker);
     }

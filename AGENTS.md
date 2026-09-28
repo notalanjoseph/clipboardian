@@ -21,10 +21,25 @@ Project was renamed from "clipboard-history" to "clipboardian" after initial
 build. `package.json`'s `name` field drives Electron's default `userData`
 path (`app.getPath('userData')`), so this rename moved the SQLite DB from
 `~/.config/clipboard-history/` to `~/.config/clipboardian/` — old history
-didn't migrate (deliberately not attempted, low-stakes data). If the parent
-directory itself is ever renamed/moved, re-run `./setup.sh` afterward — the
-registered hotkey command and the autostart `.desktop` file both bake in an
-absolute path resolved at setup time, and won't update themselves.
+didn't migrate (deliberately not attempted, low-stakes data). Moving the
+`.AppImage` file is handled automatically: every launch self-heals the hotkey
+command and autostart `Exec=` path (see "Packaging" below).
+
+**The AppImage is the only install method. `setup.sh` was removed on
+2026-09-28.** It was a bash + Python duplicate of everything
+`src/main/appImageSetup.ts` does, covering hotkey conflict detection,
+autostart and the GNOME Shell extension. Every setup change had to be
+written and reviewed twice, and the two copies interacted through shared
+gsettings and marker files. That duplication produced a steady stream of
+code-review findings. Building from source now means `pnpm run dist` and
+running the result, which is the same single code path. `pnpm start` is dev
+only and registers nothing. Existing `setup.sh` installs migrate by quitting
+the source instance and running the AppImage, which takes over the same
+hotkey slot (keeping the binding) and autostart file, then installs the
+extension fresh; verified in an isolated sandbox. Where
+`setup.sh` appears below, it's history explaining how a decision was reached,
+and `appImageSetup.ts` is the implementation. **Don't reintroduce a second
+setup path**; if one is ever needed, make it call `appImageSetup.ts`'s logic.
 
 ## Dev commands
 
@@ -33,9 +48,15 @@ pnpm install       # postinstall runs electron-rebuild for better-sqlite3's nati
 pnpm run build     # tsc + copies static renderer assets (html/css/png) into build/
 pnpm start          # build + launch (electron --no-sandbox .)
 pnpm test           # build + node:test unit tests for store.ts (see below)
+pnpm run dist       # build dist/Clipboardian-<version>.AppImage — the only install path
+./node_modules/.bin/electron --no-sandbox . --toggle-popup   # open a `pnpm start` instance's popup
 ```
 
-**`pnpm test` covers `store.ts` only** (`src/main/store.test.ts`) — dedup,
+Dev mode (`pnpm start`) registers no hotkey, autostart or extension. Test
+anything in `appImageSetup.ts` via a built AppImage, or in the isolated
+dbus/dconf sandbox described under the cursor-placement section.
+
+**`pnpm test` covers `store.ts` (`src/main/store.test.ts`) and the pure popup-placement math (`src/main/popupPlacement.test.ts`)** — dedup,
 prune-to-500, search ordering/filtering, `touch`, `getById`, `wipeData`'s
 on-disk cleanup. Everything else (Electron main-process wiring, the
 renderer, real GUI interaction) still has zero automated coverage and
@@ -108,8 +129,8 @@ src/main/appImageSetup.ts     packaged-AppImage-only: registers hotkey + autosta
                               first launch, self-heals on move, respects user opt-outs
 src/preload/preload.ts        contextBridge exposing window.clipboardAPI to the renderer
 src/renderer/                 index.html + renderer.ts (vanilla, no framework) + styles.css
-setup.sh                      user-run: pnpm install + build, registers the GNOME
-                              custom keybinding (append-only), writes autostart entry
+gnome-extension/<uuid>/       GNOME Shell extension exposing the real pointer position over
+                              D-Bus, for cursor-relative popup placement (see below)
 resources/icon.png            512x512 app icon, used by electron-builder for the AppImage
                               (separate from src/renderer/tray-icon.png, the small tray icon)
 ```
@@ -150,9 +171,9 @@ Don't re-attempt these without re-reading why they were rejected:
   requiring anywhere. `--no-sandbox` is the standard sudo-free workaround and
   is safe here since the app only ever loads its own local `file://` content,
   never remote/untrusted pages. The flag is baked into `package.json`'s
-  `start` script and into both things `./setup.sh` generates
-  (the registered hotkey command and the autostart `.desktop` file) — all
-  three must stay in sync if this ever changes.
+  `start` script and the AppImage toggle wrapper's fast path (see
+  `ensureFastToggleWrapper()`); the AppImage's own `AppRun` adds it
+  adaptively otherwise (see "Packaging").
 
 - **`pnpm` needs `onlyBuiltDependencies` in `package.json`.** By default pnpm
   silently *ignores* install/postinstall scripts for `electron` (which
@@ -174,7 +195,8 @@ Don't re-attempt these without re-reading why they were rejected:
   pre-existing `custom0` entry, and a naive overwrite would have silently
   deleted it.
 
-- **`setup.sh` also installs the autostart entry** (writes
+- *(Historical: `setup.sh` is removed; the AppImage's `ensureAutostart()`
+  now writes this file.)* **`setup.sh` also installed the autostart entry** (writes
   `~/.config/autostart/clipboardian.desktop` directly via a heredoc, using
   the same `$REPO_DIR`/`$ELECTRON_BIN` it resolves for the hotkey command).
   There used to be a separate static `clipboard-history.desktop.template`
@@ -570,6 +592,112 @@ Don't re-attempt these without re-reading why they were rejected:
   found in a future upstream bug report, not just retrying the same five
   mechanisms.
 
+- **Cursor-relative popup placement needs a GNOME Shell extension
+  (`gnome-extension/clipboardian@notalanjoseph.github.io/`) — confirmed
+  necessary on the user's machine, not assumed.** Two cheaper approaches were
+  tried first and both failed:
+  1. `screen.getCursorScreenPoint()`: a probe logged it every 250ms for 30s
+     while the user moved the pointer across both monitors over native
+     Wayland windows, and it printed one value (`1895,58`) and never
+     changed. It goes through XWayland, which only learns the pointer
+     position while the pointer is over an X11 surface. "Centre on the
+     cursor's monitor" was ruled out for the same reason: it would really
+     mean "the monitor where the pointer last touched an X11 window",
+     mostly the popup itself.
+  2. Skipping `setPosition()` so Mutter places the window itself (Mutter
+     knows the real pointer): the popup always appeared on the HDMI
+     monitor. Mutter doesn't re-place a pre-warmed window when it's
+     re-shown.
+
+  The extension exports `io.github.notalanjoseph.Clipboardian.GetPointer`
+  at `/io/github/notalanjoseph/Clipboardian` on GNOME Shell's own bus
+  connection (`org.gnome.Shell`), returning `global.get_pointer()`.
+  `popupWindow.ts`'s `pointerFromShell()` calls it through `gdbus` on every
+  show (a failed call costs ~4ms) and falls back to centring on the primary
+  monitor when the call fails. Verified working by the user after a
+  re-login: `State: ACTIVE`, live coordinates, and the popup followed the
+  pointer. The extension uses the GNOME 45+ ESM format. `metadata.json`'s
+  `shell-version` deliberately lists **future, untested** versions too
+  (45–52), so shipping a release for every GNOME release isn't required. It
+  only uses `Gio.DBusExportedObject`, `global.get_pointer()` and the
+  `Extension` base class, and a breakage fails safe (the popup goes back to
+  centring). **Extend the list before GNOME 53**, or whenever GNOME breaks
+  the extension API; after the ceiling, GNOME refuses to load it. Users
+  can't fix it locally: `ensureExtension()` overwrites any installed file
+  that differs from the bundled copy on every launch, so a hand-edited
+  `metadata.json` gets reverted. The README tells users to look for a newer
+  release instead.
+  `ensureExtension()` reads the running shell's version (the `ShellVersion`
+  D-Bus property, ~10ms) and skips the install entirely when the bundled
+  `metadata.json` doesn't list it. That covers GNOME 42–44, where the ESM
+  format can't load either, and anything past the list's ceiling. It writes
+  no files and no marker, so an OS upgrade or an app update that extends the
+  list installs it normally, and no "re-login" hint is shown that can't come
+  true. If the version can't be read, the install goes ahead.
+  **HiDPI conversion (`src/main/popupPlacement.ts` `stageToDip()`) is
+  covered by unit tests only.** This machine is in logical layout mode
+  (`scale-monitor-framebuffer` on, `Xft.dpi` 96, scale 1), where stage
+  coordinates equal Electron DIPs. An earlier version used them as-is
+  everywhere, reasoning that GNOME's default HiDPI mode also gives XWayland
+  logical pixels. **That was wrong**, and a code review caught it. Plain
+  integer scaling, GNOME's default when fractional scaling is off, uses the
+  *physical* layout: stage and X11 are both physical pixels while Electron
+  divides by its `Xft.dpi` scale, so the popup would open at double the
+  offset. The rule is: divide by Electron's scale factor, except when
+  `xwayland-native-scaling` (GNOME 47+ opt-in) is on, because there X11 is
+  physical but the stage is logical and the two cancel out. The module
+  comment has the full mode table. `screen.screenToDipPoint()` would be
+  the obvious API, but it is **not a function at runtime on Linux in
+  Electron 33**, although the typings declare it; confirmed with `typeof`.
+  If a HiDPI user reports a misplaced popup, check their layout mode
+  (`org.gnome.Mutter.DisplayConfig` `GetCurrentState` → `layout-mode` 1 =
+  logical, 2 = physical) against that table first. The `gdbus` call runs
+  synchronously on every show (4–10ms typical), with a 100ms timeout cap.
+
+  **GNOME Shell on Wayland only discovers new extensions at login**, so
+  every install path says "log out and back in once". `gnome-extensions
+  info` reports "doesn't exist" until then, which is expected, not an error.
+
+  The install mirrors the autostart pattern. `ensureExtension()` in
+  `appImageSetup.ts` installs the files and adds the uuid to
+  `org.gnome.shell enabled-extensions` only on first install. A
+  `.extension-managed` marker makes a user's later deletion stick, and a
+  user disabling it in the Extensions app sticks too. Files are refreshed
+  when they differ from the bundled copy, i.e. on an app update. The files
+  are read with `readFileSync` because they live inside `app.asar`: the
+  build script copies `gnome-extension/` into `build/`. `uninstall()` removes
+  the files, the `enabled-extensions` entry and the marker (added to the
+  cleanup list per the marker lesson above). A failed enable writes no
+  marker and reports nothing, so no notification promises cursor placement
+  that won't happen, and the next launch retries. (`setup.sh` never
+  installed the extension in any committed version. Extension support
+  there only existed in uncommitted work before it was removed, so a
+  migrating `setup.sh` user never has an extension or its marker.)
+  The helpers must stay on any Python 3: `str.removeprefix` (3.9+) was
+  briefly used there and would have broken the **hotkey** setup on Python
+  3.8, because `PY_ARRAY_APPEND` is shared. They use `startswith` plus
+  slicing instead. The array helpers strip gsettings' `@as `
+  prefix, because an empty string array prints as `@as []`, which
+  `ast.literal_eval` can't parse. Empty `enabled-extensions` is the norm
+  outside Ubuntu.
+
+  **Testing gotcha, and a real incident: `dbus-run-session -- env HOME=tmp
+  ...` does NOT isolate gsettings.** The private bus's dbus-daemon starts
+  *before* `env` applies, so the dconf-service it activates has the real
+  `HOME` and wrote the test's values into the real `~/.config/dconf/user`,
+  without notifying the real session. The real dconf-service then kept
+  serving its in-memory copy and treated a same-value restore as a no-op,
+  so the damage would only have shown at next login: the user's other
+  extensions, such as Ubuntu Dock, would have been disabled. Recovered by
+  writing a *different* value and then the correct one, which forced the
+  real service to rewrite the file from its correct in-memory state. The
+  correct isolation is `env HOME=tmp XDG_CONFIG_HOME=tmp/.config
+  XDG_DATA_HOME=... XDG_RUNTIME_DIR=tmp/run dbus-run-session -- ...`, with
+  `env` outside. Check `sha256sum ~/.config/dconf/user` before and after as
+  a guard. Verified that way: install, idempotent re-run, stale-file
+  refresh, user-deleted dir not reinstalled, and uninstall all behaved
+  correctly, with the real dconf file byte-identical.
+
 ## Packaging (AppImage via electron-builder)
 
 - **`electron` must be a `devDependency`, not a regular `dependency`.**
@@ -652,7 +780,7 @@ Don't re-attempt these without re-reading why they were rejected:
   (`src/main/appImageSetup.ts`), gated entirely on `process.env.APPIMAGE`
   being set** (confirmed present even under `--appimage-extract-and-run`, not
   assumed) — so `pnpm start`/dev-mode `electron .` never has this var set and
-  is completely unaffected; that flow still relies on `setup.sh`. Called as
+  is completely unaffected. Dev mode deliberately registers nothing. Called as
   the *last* line inside `main.ts`'s `whenReady()`, after tray creation and
   `popupWindow.createHidden()`, since every step is a blocking
   `execFileSync` call and shouldn't delay the tray icon or the popup
@@ -768,10 +896,10 @@ Don't re-attempt these without re-reading why they were rejected:
 
 - **Tray "Uninstall..." (`appImageSetup.uninstall()`) is deliberately NOT
   gated on `process.env.APPIMAGE`**, unlike `ensureHotkeyAndAutostart()`.
-  `setup.sh` (dev mode) and the AppImage's own first-run setup both write
-  into the exact same gsettings slot name/path, so one cleanup function
-  correctly reverses either — gating it to AppImage-only would leave
-  dev-mode users with no way to clean up via the tray at all.
+  The AppImage's first-run setup and the since-removed `setup.sh` wrote into
+  the exact same gsettings slot name/path, so one cleanup function reverses
+  either. Keeping it ungated still matters: it's how an old `setup.sh`
+  install can be cleaned up from a dev-mode tray.
 
   **Real race condition found and fixed during testing, not assumed away:**
   the popup window's renderer calls `search` once on its own initial page
