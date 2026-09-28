@@ -1,6 +1,6 @@
 {
   "name": "clipboardian",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "description": "Local clipboard text history with a global-hotkey search popup",
   "desktopName": "clipboardian.desktop",
   "author": "Alan Joseph",
