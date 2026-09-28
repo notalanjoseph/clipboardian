@@ -147,6 +147,17 @@ Build output (`build/`) mirrors `src/` 1:1 for the TS files; `pnpm run build`
 additionally copies `index.html`, `styles.css`, `tray-icon.png` into
 `build/renderer/` since `tsc` only compiles `.ts`.
 
+`tsconfig.json` uses `"module"`/`"moduleResolution": "Node16"`, because
+TypeScript 6 deprecates the old `"Node"` (node10) resolution and TypeScript 7
+removes it. It also sets **`"moduleDetection": "legacy"`, which is required,
+not clutter**. Under Node16 without it, TypeScript treats the import-free
+`renderer.ts` as a module and emits an `exports` line into `renderer.js`.
+That file is a plain `<script>` in the popup, so it would throw
+`exports is not defined` on load. The store tests wouldn't catch this, since
+they don't touch the renderer. The switch was verified by a byte-for-byte
+`diff -r` of `build/` before and after, and by a clean
+`tsc --noEmit` under TypeScript 6.0.3.
+
 ## Non-obvious decisions and dead ends already ruled out
 
 Don't re-attempt these without re-reading why they were rejected:
